@@ -130,6 +130,10 @@ class AirflowConfigParser(ConfigParser):
         ('celery', 'result_backend'),
         # Todo: remove this in Airflow 1.11
         ('celery', 'celery_result_backend'),
+        ('atlas', 'password'),
+        ('smtp', 'smtp_password'),
+        ('ldap', 'bind_password'),
+        ('kubernetes', 'git_password'),
     }
 
     # A two-level mapping of (section -> new_name -> old_name). When reading
@@ -139,6 +143,7 @@ class AirflowConfigParser(ConfigParser):
         'celery': {
             # Remove these keys in Airflow 1.11
             'worker_concurrency': 'celeryd_concurrency',
+            'result_backend': 'celery_result_backend',
             'broker_url': 'celery_broker_url',
             'ssl_active': 'celery_ssl_active',
             'ssl_cert': 'celery_ssl_cert',

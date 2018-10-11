@@ -1,5 +1,4 @@
-#!/usr/bin/env bash
-
+# -*- coding: utf-8 -*-
 #
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
@@ -18,24 +17,27 @@
 # specific language governing permissions and limitations
 # under the License.
 
-set -exuo pipefail
+import mock
+import unittest
 
-FQDN=`hostname`
-ADMIN="admin"
-PASS="airflow"
-KRB5_KTNAME=/etc/airflow.keytab
+from airflow.sensors.s3_prefix_sensor import S3PrefixSensor
 
-cat /etc/hosts
-echo "hostname: ${FQDN}"
-# create kerberos database
-echo -e "${PASS}\n${PASS}" | kdb5_util create -s
-# create admin
-echo -e "${PASS}\n${PASS}" | kadmin.local -q "addprinc ${ADMIN}/admin"
-# create airflow
-echo -e "${PASS}\n${PASS}" | kadmin.local -q "addprinc -randkey airflow"
-echo -e "${PASS}\n${PASS}" | kadmin.local -q "addprinc -randkey airflow/${FQDN}"
-kadmin.local -q "ktadd -k ${KRB5_KTNAME} airflow"
-kadmin.local -q "ktadd -k ${KRB5_KTNAME} airflow/${FQDN}"
 
-# Start services
-/usr/local/bin/supervisord -n -c /etc/supervisord.conf
+class S3PrefixSensorTests(unittest.TestCase):
+
+    @mock.patch('airflow.hooks.S3_hook.S3Hook')
+    def test_poke(self, mock_hook):
+        s = S3PrefixSensor(
+            task_id='s3_prefix',
+            bucket_name='bucket',
+            prefix='prefix')
+
+        mock_hook.return_value.check_for_prefix.return_value = False
+        self.assertFalse(s.poke(None))
+        mock_hook.return_value.check_for_prefix.assert_called_with(
+            prefix='prefix',
+            delimiter='/',
+            bucket_name='bucket')
+
+        mock_hook.return_value.check_for_prefix.return_value = True
+        self.assertTrue(s.poke(None))

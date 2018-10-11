@@ -33,7 +33,11 @@ try:
 except ImportError:
     import urlparse
 
+RESTART_CLUSTER_ENDPOINT = ("POST", "api/2.0/clusters/restart")
+START_CLUSTER_ENDPOINT = ("POST", "api/2.0/clusters/start")
+TERMINATE_CLUSTER_ENDPOINT = ("POST", "api/2.0/clusters/delete")
 
+RUN_NOW_ENDPOINT = ('POST', 'api/2.0/jobs/run-now')
 SUBMIT_RUN_ENDPOINT = ('POST', 'api/2.0/jobs/runs/submit')
 GET_RUN_ENDPOINT = ('GET', 'api/2.0/jobs/runs/get')
 CANCEL_RUN_ENDPOINT = ('POST', 'api/2.0/jobs/runs/cancel')
@@ -52,7 +56,7 @@ class DatabricksHook(BaseHook, LoggingMixin):
             retry_delay=1.0):
         """
         :param databricks_conn_id: The name of the databricks connection to use.
-        :type databricks_conn_id: string
+        :type databricks_conn_id: str
         :param timeout_seconds: The amount of time in seconds the requests library
             will wait before timing-out.
         :type timeout_seconds: int
@@ -158,6 +162,18 @@ class DatabricksHook(BaseHook, LoggingMixin):
             attempt_num, error
         )
 
+    def run_now(self, json):
+        """
+        Utility function to call the ``api/2.0/jobs/run-now`` endpoint.
+
+        :param json: The data used in the body of the request to the ``run-now`` endpoint.
+        :type json: dict
+        :return: the run_id as a string
+        :rtype: str
+        """
+        response = self._do_api_call(RUN_NOW_ENDPOINT, json)
+        return response['run_id']
+
     def submit_run(self, json):
         """
         Utility function to call the ``api/2.0/jobs/runs/submit`` endpoint.
@@ -165,7 +181,7 @@ class DatabricksHook(BaseHook, LoggingMixin):
         :param json: The data used in the body of the request to the ``submit`` endpoint.
         :type json: dict
         :return: the run_id as a string
-        :rtype: string
+        :rtype: str
         """
         response = self._do_api_call(SUBMIT_RUN_ENDPOINT, json)
         return response['run_id']
@@ -188,6 +204,15 @@ class DatabricksHook(BaseHook, LoggingMixin):
     def cancel_run(self, run_id):
         json = {'run_id': run_id}
         self._do_api_call(CANCEL_RUN_ENDPOINT, json)
+
+    def restart_cluster(self, json):
+        self._do_api_call(RESTART_CLUSTER_ENDPOINT, json)
+
+    def start_cluster(self, json):
+        self._do_api_call(START_CLUSTER_ENDPOINT, json)
+
+    def terminate_cluster(self, json):
+        self._do_api_call(TERMINATE_CLUSTER_ENDPOINT, json)
 
 
 def _retryable_error(exception):

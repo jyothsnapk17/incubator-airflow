@@ -43,7 +43,7 @@ class S3KeySensor(BaseSensorOperator):
     :type wildcard_match: bool
     :param aws_conn_id: a reference to the s3 connection
     :type aws_conn_id: str
-    :parame verify: Whether or not to verify SSL certificates for S3 connection.
+    :param verify: Whether or not to verify SSL certificates for S3 connection.
         By default SSL certificates are verified.
         You can provide the following values:
         - False: do not validate SSL certificates. SSL will still be used
@@ -73,10 +73,7 @@ class S3KeySensor(BaseSensorOperator):
                 raise AirflowException('Please provide a bucket_name')
             else:
                 bucket_name = parsed_url.netloc
-                if parsed_url.path[0] == '/':
-                    bucket_key = parsed_url.path[1:]
-                else:
-                    bucket_key = parsed_url.path
+                bucket_key = parsed_url.path.lstrip('/')
         else:
             parsed_url = urlparse(bucket_key)
             if parsed_url.scheme != '' or parsed_url.netloc != '':
@@ -97,5 +94,4 @@ class S3KeySensor(BaseSensorOperator):
         if self.wildcard_match:
             return hook.check_for_wildcard_key(self.bucket_key,
                                                self.bucket_name)
-        else:
-            return hook.check_for_key(self.bucket_key, self.bucket_name)
+        return hook.check_for_key(self.bucket_key, self.bucket_name)
