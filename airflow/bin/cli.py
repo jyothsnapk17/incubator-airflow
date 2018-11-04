@@ -33,6 +33,7 @@ import getpass
 import reprlib
 import argparse
 from builtins import input
+from operator import attrgetter
 from collections import namedtuple
 from airflow.utils.timezone import parse as parsedate
 import json
@@ -147,7 +148,7 @@ def get_dag(args):
     dagbag = DagBag(process_subdir(args.subdir))
     if args.dag_id not in dagbag.dags:
         raise AirflowException(
-            'dag_id could not be found: {}. Either the dag did not exist or it failed to '
+            'dag_id could not be found: {}. Either the dag does not exist or it failed to '
             'parse.'.format(args.dag_id))
     return dagbag.dags[args.dag_id]
 
@@ -160,7 +161,7 @@ def get_dags(args):
         args.dag_id, dag.dag_id)]
     if not matched_dags:
         raise AirflowException(
-            'dag_id could not be found with regex: {}. Either the dag did not exist '
+            'dag_id could not be found with regex: {}. Either the dag does not exist '
             'or it failed to parse.'.format(args.dag_id))
     return matched_dags
 
@@ -265,6 +266,7 @@ def delete_dag(args):
 
 @cli_utils.action_logging
 def pool(args):
+    # print(args)
     log = LoggingMixin().log
 
     def _tabulate(pools):
@@ -289,12 +291,16 @@ def pool(args):
                 pools = api_client.get_pools()
         elif args.export:
             pools = pool_export_helper(args.export)
-        else:
+        elif args.list:
             pools = api_client.get_pools()
+        else:
+            pools = None
     except (AirflowException, IOError) as err:
         log.error(err)
     else:
-        log.info(_tabulate(pools=pools))
+        # pools = api_client.get_pools()
+        if pools:
+            log.info(_tabulate(pools=pools))
 
 
 def pool_import_helper(filepath):
@@ -336,14 +342,30 @@ def pool_export_helper(filepath):
 
 @cli_utils.action_logging
 def variables(args):
+    log = LoggingMixin().log
+    log.debug(args)
+
+    def _tabulate(vars):
+        return "\n%s" % tabulate(vars, ["Variable Name", "Value"],
+                                 tablefmt="fancy_grid")
+
+    if args.list:
+        session = settings.Session()
+        vars = session.query(Variable)
+        vars = [(var.key, Variable.get(var.key)) for var in vars]
+        msg = tabulate(vars,
+                       ["Variable Name", "Value"],
+                       tablefmt="fancy_grid")
+        # print(msg)
+        log.info(_tabulate(vars))
     if args.get:
         try:
             var = Variable.get(args.get,
                                deserialize_json=args.json,
                                default_var=args.default)
-            print(var)
+            log.info(var)
         except ValueError as e:
-            print(e)
+            log.error(e)
     if args.delete:
         session = settings.Session()
         session.query(Variable).filter_by(key=args.delete).delete()
@@ -357,15 +379,9 @@ def variables(args):
         if os.path.exists(imp):
             import_helper(imp)
         else:
-            print("Missing variables file.")
+            log.error("Missing variables file.")
     if args.export:
         export_helper(args.export)
-    if not (args.set or args.get or imp or args.export or args.delete):
-        # list all variables
-        session = settings.Session()
-        vars = session.query(Variable)
-        msg = "\n".join(var.key for var in vars)
-        print(msg)
 
 
 def import_helper(filepath):
@@ -608,10 +624,17 @@ def task_state(args):
     >>> airflow task_state tutorial sleep 2015-01-01
     success
     """
+    log = LoggingMixin().log
     dag = get_dag(args)
     task = dag.get_task(task_id=args.task_id)
     ti = TaskInstance(task, args.execution_date)
-    print(ti.current_state())
+    if not ti.current_state():
+        raise AirflowException("The Execution Date {ex_date} does not exist for {task}".format(
+            ex_date=args.execution_date,
+            task=args.task_id))
+    log.info("\n%s"%tabulate([(args.task_id, ti.current_state())],
+                             headers=['TASK_ID', 'STATE'],
+                             tablefmt="fancy_grid"))
 
 
 @cli_utils.action_logging
@@ -621,10 +644,19 @@ def dag_state(args):
     >>> airflow dag_state tutorial 2015-01-01T00:00:00.000000
     running
     """
+    log = LoggingMixin().log
+
     dag = get_dag(args)
     dr = DagRun.find(dag.dag_id, execution_date=args.execution_date)
-    print(dr[0].state if len(dr) > 0 else None)
-
+    # print(dr[0].state if len(dr) > 0 else None)
+    if len(dr) == 0:
+        raise AirflowException("The Execution Date {ex_date} does not exist for {dag}".format(
+            ex_date=args.execution_date,
+            dag=args.dag_id))
+    else:
+        log.info("\n%s" % tabulate([(args.dag_id, dr[0].state)],
+                          headers=['DAG_ID', 'STATUS'],
+                          tablefmt="fancy_grid"))
 
 @cli_utils.action_logging
 def next_execution(args):
@@ -633,48 +665,62 @@ def next_execution(args):
     >>> airflow next_execution tutorial
     2018-08-31 10:38:00
     """
+    log = LoggingMixin().log
     dag = get_dag(args)
 
     if dag.is_paused:
-        print("[INFO] Please be reminded this DAG is PAUSED now.")
+        log.info("Please be reminded this DAG is PAUSED now.")
 
     if dag.latest_execution_date:
         next_execution_dttm = dag.following_schedule(dag.latest_execution_date)
 
         if next_execution_dttm is None:
-            print("[WARN] No following schedule can be found. " +
+            log.warning("No following schedule can be found. " +
                   "This DAG may have schedule interval '@once' or `None`.")
-
-        print(next_execution_dttm)
+        else:
+        # print(next_execution_dttm)
+            log.info("\n%s" % tabulate([(args.dag_id, next_execution_dttm)],
+                                       headers=['DAG_ID', 'NEXT_EXECUTION_DATE'],
+                                       tablefmt="fancy_grid"))
     else:
-        print("[WARN] Only applicable when there is execution record found for the DAG.")
-        print(None)
+        log.warning("'next_execution' is only applicable when there is execution record found for the DAG.")
+        # print(None)
 
 
 @cli_utils.action_logging
 def list_dags(args):
+    log = LoggingMixin().log
+
+    def _tabulate(dags):
+        return "\n%s" % tabulate(dags, ['DAG ID'],
+                                 tablefmt="fancy_grid")
+
     dagbag = DagBag(process_subdir(args.subdir))
-    s = textwrap.dedent("""\n
-    -------------------------------------------------------------------
-    DAGS
-    -------------------------------------------------------------------
-    {dag_list}
-    """)
-    dag_list = "\n".join(sorted(dagbag.dags))
-    print(s.format(dag_list=dag_list))
+    dags = [[dag] for dag in sorted(dagbag.dags.keys())]
+    log.info(_tabulate(dags))
     if args.report:
         print(dagbag.dagbag_report())
 
 
 @cli_utils.action_logging
 def list_tasks(args, dag=None):
+    log = LoggingMixin().log
+
     dag = dag or get_dag(args)
     if args.tree:
         dag.tree_view()
     else:
-        tasks = sorted([t.task_id for t in dag.tasks])
-        print("\n".join(sorted(tasks)))
+        task_list = []
+        headers = ['TASK_ID', 'UPSTREAM_TASKS', 'DOWNSTREAM_TASKS']
+        task_tuple = namedtuple('Task', ','.join(headers))
+        for t in sorted(dag.tasks, key=lambda k: len(k.upstream_list)):
+            task_list.append(task_tuple(t.task_id,
+                                        [up_task.task_id for up_task in t.upstream_list] or "-",
+                                        [down_t.task_id for down_t in t.downstream_list] or "-"))
 
+        log.info("\n%s" % tabulate(task_list,
+                                   headers=headers,
+                                   tablefmt="fancy_grid"))
 
 @cli_utils.action_logging
 def test(args, dag=None):
@@ -1157,6 +1203,9 @@ alternative_conn_specs = ['conn_type', 'conn_host',
 
 @cli_utils.action_logging
 def connections(args):
+    log = LoggingMixin().log
+    log.debug(args)
+
     if args.list:
         # Check that no other flags were passed to the command
         invalid_args = list()
@@ -1167,7 +1216,7 @@ def connections(args):
             msg = ('\n\tThe following args are not compatible with the ' +
                    '--list flag: {invalid!r}\n')
             msg = msg.format(invalid=invalid_args)
-            print(msg)
+            log.info(msg)
             return
 
         session = settings.Session()
@@ -1182,7 +1231,7 @@ def connections(args):
                        tablefmt="fancy_grid")
         if sys.version_info[0] < 3:
             msg = msg.encode('utf-8')
-        print(msg)
+        log.info(msg)
         return
 
     if args.delete:
@@ -1439,6 +1488,14 @@ def users(args):
 
 @cli_utils.action_logging
 def list_dag_runs(args, dag=None):
+    log = LoggingMixin().log
+
+    def _tabulate(dag_runs):
+        return "\n%s" % tabulate(dag_runs,
+                                 # ['ID', 'Run_ID', 'State', 'Execution Date', 'Start Date'],
+                                 headers="keys",
+                                 tablefmt="fancy_grid")
+
     if dag:
         args.dag_id = dag.dag_id
 
@@ -1450,44 +1507,58 @@ def list_dag_runs(args, dag=None):
 
     dag_runs = list()
     state = args.state.lower() if args.state else None
+    dag_run = namedtuple('Dag_Run', 'ID, RUN_ID, STATE, DAG_ID, EXECUTION_DATE, START_DATE')
     for run in DagRun.find(dag_id=args.dag_id,
                            state=state,
                            no_backfills=args.no_backfill):
-        dag_runs.append({
-            'id': run.id,
-            'run_id': run.run_id,
-            'state': run.state,
-            'dag_id': run.dag_id,
-            'execution_date': run.execution_date.isoformat(),
-            'start_date': ((run.start_date or '') and
-                           run.start_date.isoformat()),
-        })
+        dag_runs.append(dag_run(run.id,
+                                run.run_id,
+                                run.state,
+                                run.dag_id,
+                                run.execution_date.isoformat(),
+                                ((run.start_date or '') and
+                                 run.start_date.isoformat())
+                                ))
+        # dag_runs.append({
+        #     'id': run.id,
+        #     'run_id': run.run_id,
+        #     'state': run.state,
+        #     'dag_id': run.dag_id,
+        #     'execution_date': run.execution_date.isoformat(),
+        #     'start_date': ((run.start_date or '') and
+        #                    run.start_date.isoformat()),
+        # })
     if not dag_runs:
-        print('No dag runs for {dag_id}'.format(dag_id=args.dag_id))
+        log.info('No dag runs for {dag_id}'.format(dag_id=args.dag_id))
+        return ##don't print table
 
-    s = textwrap.dedent("""\n
-    {line}
-    DAG RUNS
-    {line}
-    {dag_run_header}
-    """)
 
-    dag_runs.sort(key=lambda x: x['execution_date'], reverse=True)
-    dag_run_header = '%-3s | %-20s | %-10s | %-20s | %-20s |' % ('id',
-                                                                 'run_id',
-                                                                 'state',
-                                                                 'execution_date',
-                                                                 'state_date')
-    print(s.format(dag_run_header=dag_run_header,
-                   line='-' * 120))
-    for dag_run in dag_runs:
-        record = '%-3s | %-20s | %-10s | %-20s | %-20s |' % (dag_run['id'],
-                                                             dag_run['run_id'],
-                                                             dag_run['state'],
-                                                             dag_run['execution_date'],
-                                                             dag_run['start_date'])
-        print(record)
+    # s = textwrap.dedent("""\n
+    # {line}
+    # DAG RUNS
+    # {line}
+    # {dag_run_header}
+    # """)
 
+    # dag_runs.sort(key=lambda x: x['execution_date'], reverse=True)
+    # dag_run_header = '%-3s | %-20s | %-10s | %-20s | %-20s |' % ('id',
+    #                                                              'run_id',
+    #                                                              'state',
+    #                                                              'execution_date',
+    #                                                              'state_date')
+    # print(s.format(dag_run_header=dag_run_header,
+    #                line='-' * 120))
+
+    # for dag_run in dag_runs:
+    #     record = '%-3s | %-20s | %-10s | %-20s | %-20s |' % (dag_run['id'],
+    #                                                          dag_run['run_id'],
+    #                                                          dag_run['state'],
+    #                                                          dag_run['execution_date'],
+    #                                                          dag_run['start_date'])
+    #     print(record)
+    log.info("\n%s" % tabulate(dag_runs,
+                               headers="keys",
+                               tablefmt="fancy_grid"))
 
 @cli_utils.action_logging
 def sync_perm(args): # noqa
@@ -1647,6 +1718,10 @@ class CLIFactory(object):
             ("-e", "--exec_date"), help="The execution date of the DAG",
             type=parsedate),
         # pool
+        'pool_list': Arg(
+            ("-l", "--list"),
+            help="List all Pools",
+            action='store_true'),
         'pool_set': Arg(
             ("-s", "--set"),
             nargs=3,
@@ -1669,6 +1744,10 @@ class CLIFactory(object):
             metavar="FILEPATH",
             help="Export pool to JSON file"),
         # variables
+        'list_vars': Arg(
+            ('-l', '--list'),
+            help='List all variables',
+            action='store_true'),
         'set': Arg(
             ("-s", "--set"),
             nargs=2,
@@ -2006,11 +2085,11 @@ class CLIFactory(object):
         }, {
             'func': pool,
             'help': "CRUD operations on pools",
-            "args": ('pool_set', 'pool_get', 'pool_delete', 'pool_import', 'pool_export'),
+            "args": ('pool_list', 'pool_set', 'pool_get', 'pool_delete', 'pool_import', 'pool_export'),
         }, {
             'func': variables,
             'help': "CRUD operations on variables",
-            "args": ('set', 'get', 'json', 'default',
+            "args": ('list_vars', 'set', 'get', 'json', 'default',
                      'var_import', 'var_export', 'var_delete'),
         }, {
             'func': kerberos,
@@ -2136,16 +2215,22 @@ class CLIFactory(object):
         subparser_list = cls.dag_subparsers if dag_parser else cls.subparsers_dict.keys()
         for sub in subparser_list:
             sub = cls.subparsers_dict[sub]
+            # print(sub)
             sp = subparsers.add_parser(sub['func'].__name__, help=sub['help'])
+            # print(sp)
             for arg in sub['args']:
                 if 'dag_id' in arg and dag_parser:
                     continue
                 arg = cls.args[arg]
+                # print(getattr(arg, f))
                 kwargs = {
                     f: getattr(arg, f)
                     for f in arg._fields if f != 'flags' and getattr(arg, f)}
                 sp.add_argument(*arg.flags, **kwargs)
+                # print(sp)
+            # print(sub['func'])
             sp.set_defaults(func=sub['func'])
+            # print(sp)
         return parser
 
 
