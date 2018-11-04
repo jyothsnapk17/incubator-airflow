@@ -438,6 +438,7 @@ def unpause(args, dag=None):
 
 
 def set_is_paused(is_paused, args, dag=None):
+    log = LoggingMixin().log
     dag = dag or get_dag(args)
 
     session = settings.Session()
@@ -446,8 +447,9 @@ def set_is_paused(is_paused, args, dag=None):
     dm.is_paused = is_paused
     session.commit()
 
-    msg = "Dag: {}, paused: {}".format(dag, str(dag.is_paused))
-    print(msg)
+    log.info("\n%s" % tabulate([(dag.dag_id, bool(dag.is_paused))],
+                            headers=['DAG ID', 'PAUSED'],
+                            tablefmt="fancy_grid"))
 
 
 def _run(args, dag, ti):
