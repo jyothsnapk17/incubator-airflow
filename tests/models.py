@@ -23,42 +23,50 @@ from __future__ import print_function
 from __future__ import unicode_literals
 
 import datetime
+import inspect
 import logging
 import os
-import pendulum
-import unittest
-import time
-import six
 import re
-import urllib
 import textwrap
-import inspect
+import time
+import unittest
+import urllib
+import uuid
+from tempfile import NamedTemporaryFile, mkdtemp
 
-from airflow import configuration, models, settings, AirflowException
+import pendulum
+import six
+from mock import ANY, Mock, mock_open, patch
+from parameterized import parameterized
+from freezegun import freeze_time
+from cryptography.fernet import Fernet
+
+from airflow import AirflowException, configuration, models, settings
+from airflow.contrib.sensors.python_sensor import PythonSensor
 from airflow.exceptions import AirflowDagCycleException, AirflowSkipException
 from airflow.jobs import BackfillJob
 from airflow.models import DAG, TaskInstance as TI
-from airflow.models import State as ST
-from airflow.models import DagModel, DagRun, DagStat
-from airflow.models import clear_task_instances
-from airflow.models import XCom
-from airflow.models import Connection
-from airflow.models import SkipMixin
+from airflow.models import DagModel, DagRun
 from airflow.models import KubeResourceVersion, KubeWorkerIdentifier
-from airflow.jobs import LocalTaskJob
-from airflow.operators.dummy_operator import DummyOperator
+from airflow.models import SkipMixin
+from airflow.models import State as ST
+from airflow.models import TaskReschedule as TR
+from airflow.models import XCom
+from airflow.models import Variable
+from airflow.models import clear_task_instances
+from airflow.models.connection import Connection
 from airflow.operators.bash_operator import BashOperator
+from airflow.operators.dummy_operator import DummyOperator
 from airflow.operators.python_operator import PythonOperator
 from airflow.operators.python_operator import ShortCircuitOperator
 from airflow.operators.subdag_operator import SubDagOperator
 from airflow.ti_deps.deps.trigger_rule_dep import TriggerRuleDep
 from airflow.utils import timezone
-from airflow.utils.weight_rule import WeightRule
+from airflow.utils.dag_processing import SimpleTaskInstance
+from airflow.utils.db import create_session
 from airflow.utils.state import State
 from airflow.utils.trigger_rule import TriggerRule
-from mock import patch, Mock, ANY
-from parameterized import parameterized
-from tempfile import mkdtemp, NamedTemporaryFile
+from airflow.utils.weight_rule import WeightRule
 
 DEFAULT_DATE = timezone.datetime(2016, 1, 1)
 TEST_DAGS_FOLDER = os.path.join(
@@ -225,7 +233,13 @@ class DagTest(unittest.TestCase):
             start_date=DEFAULT_DATE,
             default_args={'owner': 'owner1'})
 
-        self.assertEquals(tuple(), dag.topological_sort())
+        self.assertEqual(tuple(), dag.topological_sort())
+
+    def test_dag_naive_default_args_start_date(self):
+        dag = DAG('DAG', default_args={'start_date': datetime.datetime(2018, 1, 1)})
+        self.assertEqual(dag.timezone, settings.TIMEZONE)
+        dag = DAG('DAG', start_date=datetime.datetime(2018, 1, 1))
+        self.assertEqual(dag.timezone, settings.TIMEZONE)
 
     def test_dag_none_default_args_start_date(self):
         """
@@ -264,7 +278,7 @@ class DagTest(unittest.TestCase):
                 correct_weight = ((depth - (task_depth + 1)) * width + 1) * weight
 
                 calculated_weight = task.priority_weight_total
-                self.assertEquals(calculated_weight, correct_weight)
+                self.assertEqual(calculated_weight, correct_weight)
 
         # Same test as above except use 'upstream' for weight calculation
         weight = 3
@@ -290,7 +304,7 @@ class DagTest(unittest.TestCase):
                 correct_weight = (task_depth * width + 1) * weight
 
                 calculated_weight = task.priority_weight_total
-                self.assertEquals(calculated_weight, correct_weight)
+                self.assertEqual(calculated_weight, correct_weight)
 
         # Same test as above except use 'absolute' for weight calculation
         weight = 10
@@ -316,7 +330,7 @@ class DagTest(unittest.TestCase):
                 correct_weight = weight
 
                 calculated_weight = task.priority_weight_total
-                self.assertEquals(calculated_weight, correct_weight)
+                self.assertEqual(calculated_weight, correct_weight)
 
         # Test if we enter an invalid weight rule
         with DAG('dag', start_date=DEFAULT_DATE,
@@ -395,6 +409,122 @@ class DagTest(unittest.TestCase):
         result = task.render_template('', '{{ foo }}', dict(foo='bar'))
         self.assertEqual(result, 'bar')
 
+    def test_render_template_list_field(self):
+        """Tests if render_template from a list field works"""
+
+        dag = DAG('test-dag',
+                  start_date=DEFAULT_DATE)
+
+        with dag:
+            task = DummyOperator(task_id='op1')
+
+        self.assertListEqual(
+            task.render_template('', ['{{ foo }}_1', '{{ foo }}_2'], {'foo': 'bar'}),
+            ['bar_1', 'bar_2']
+        )
+
+    def test_render_template_tuple_field(self):
+        """Tests if render_template from a tuple field works"""
+
+        dag = DAG('test-dag',
+                  start_date=DEFAULT_DATE)
+
+        with dag:
+            task = DummyOperator(task_id='op1')
+
+        # tuple is replaced by a list
+        self.assertListEqual(
+            task.render_template('', ('{{ foo }}_1', '{{ foo }}_2'), {'foo': 'bar'}),
+            ['bar_1', 'bar_2']
+        )
+
+    def test_render_template_dict_field(self):
+        """Tests if render_template from a dict field works"""
+
+        dag = DAG('test-dag',
+                  start_date=DEFAULT_DATE)
+
+        with dag:
+            task = DummyOperator(task_id='op1')
+
+        self.assertDictEqual(
+            task.render_template('', {'key1': '{{ foo }}_1', 'key2': '{{ foo }}_2'}, {'foo': 'bar'}),
+            {'key1': 'bar_1', 'key2': 'bar_2'}
+        )
+
+    def test_render_template_dict_field_with_templated_keys(self):
+        """Tests if render_template from a dict field works as expected:
+        dictionary keys are not templated"""
+
+        dag = DAG('test-dag',
+                  start_date=DEFAULT_DATE)
+
+        with dag:
+            task = DummyOperator(task_id='op1')
+
+        self.assertDictEqual(
+            task.render_template('', {'key_{{ foo }}_1': 1, 'key_2': '{{ foo }}_2'}, {'foo': 'bar'}),
+            {'key_{{ foo }}_1': 1, 'key_2': 'bar_2'}
+        )
+
+    def test_render_template_date_field(self):
+        """Tests if render_template from a date field works"""
+
+        dag = DAG('test-dag',
+                  start_date=DEFAULT_DATE)
+
+        with dag:
+            task = DummyOperator(task_id='op1')
+
+        self.assertEqual(
+            task.render_template('', datetime.date(2018, 12, 6), {'foo': 'bar'}),
+            datetime.date(2018, 12, 6)
+        )
+
+    def test_render_template_datetime_field(self):
+        """Tests if render_template from a datetime field works"""
+
+        dag = DAG('test-dag',
+                  start_date=DEFAULT_DATE)
+
+        with dag:
+            task = DummyOperator(task_id='op1')
+
+        self.assertEqual(
+            task.render_template('', datetime.datetime(2018, 12, 6, 10, 55), {'foo': 'bar'}),
+            datetime.datetime(2018, 12, 6, 10, 55)
+        )
+
+    def test_render_template_UUID_field(self):
+        """Tests if render_template from a UUID field works"""
+
+        dag = DAG('test-dag',
+                  start_date=DEFAULT_DATE)
+
+        with dag:
+            task = DummyOperator(task_id='op1')
+
+        random_uuid = uuid.uuid4()
+        self.assertIs(
+            task.render_template('', random_uuid, {'foo': 'bar'}),
+            random_uuid
+        )
+
+    def test_render_template_object_field(self):
+        """Tests if render_template from an object field works"""
+
+        dag = DAG('test-dag',
+                  start_date=DEFAULT_DATE)
+
+        with dag:
+            task = DummyOperator(task_id='op1')
+
+        test_object = object()
+        self.assertIs(
+            task.render_template('', test_object, {'foo': 'bar'}),
+            test_object
+        )
+
     def test_render_template_field_macro(self):
         """ Tests if render_template from a field works,
             if a custom filter was defined"""
@@ -451,6 +581,51 @@ class DagTest(unittest.TestCase):
 
         result = task.render_template('', "{{ 'world' | hello}}", dict())
         self.assertEqual(result, 'Hello world')
+
+    def test_resolve_template_files_value(self):
+
+        with NamedTemporaryFile(suffix='.template') as f:
+            f.write('{{ ds }}'.encode('utf8'))
+            f.flush()
+            template_dir = os.path.dirname(f.name)
+            template_file = os.path.basename(f.name)
+
+            dag = DAG('test-dag',
+                      start_date=DEFAULT_DATE,
+                      template_searchpath=template_dir)
+
+            with dag:
+                task = DummyOperator(task_id='op1')
+
+            task.test_field = template_file
+            task.template_fields = ('test_field',)
+            task.template_ext = ('.template',)
+            task.resolve_template_files()
+
+        self.assertEqual(task.test_field, '{{ ds }}')
+
+    def test_resolve_template_files_list(self):
+
+        with NamedTemporaryFile(suffix='.template') as f:
+            f = NamedTemporaryFile(suffix='.template')
+            f.write('{{ ds }}'.encode('utf8'))
+            f.flush()
+            template_dir = os.path.dirname(f.name)
+            template_file = os.path.basename(f.name)
+
+            dag = DAG('test-dag',
+                      start_date=DEFAULT_DATE,
+                      template_searchpath=template_dir)
+
+            with dag:
+                task = DummyOperator(task_id='op1')
+
+            task.test_field = [template_file, 'some_string']
+            task.template_fields = ('test_field',)
+            task.template_ext = ('.template',)
+            task.resolve_template_files()
+
+        self.assertEqual(task.test_field, ['{{ ds }}', 'some_string'])
 
     def test_cycle(self):
         # test empty
@@ -578,6 +753,96 @@ class DagTest(unittest.TestCase):
         with self.assertRaises(AirflowDagCycleException):
             dag.test_cycle()
 
+    def test_following_previous_schedule(self):
+        """
+        Make sure DST transitions are properly observed
+        """
+        local_tz = pendulum.timezone('Europe/Zurich')
+        start = local_tz.convert(datetime.datetime(2018, 10, 28, 2, 55),
+                                 dst_rule=pendulum.PRE_TRANSITION)
+        self.assertEqual(start.isoformat(), "2018-10-28T02:55:00+02:00",
+                         "Pre-condition: start date is in DST")
+
+        utc = timezone.convert_to_utc(start)
+
+        dag = DAG('tz_dag', start_date=start, schedule_interval='*/5 * * * *')
+        _next = dag.following_schedule(utc)
+        next_local = local_tz.convert(_next)
+
+        self.assertEqual(_next.isoformat(), "2018-10-28T01:00:00+00:00")
+        self.assertEqual(next_local.isoformat(), "2018-10-28T02:00:00+01:00")
+
+        prev = dag.previous_schedule(utc)
+        prev_local = local_tz.convert(prev)
+
+        self.assertEqual(prev_local.isoformat(), "2018-10-28T02:50:00+02:00")
+
+        prev = dag.previous_schedule(_next)
+        prev_local = local_tz.convert(prev)
+
+        self.assertEqual(prev_local.isoformat(), "2018-10-28T02:55:00+02:00")
+        self.assertEqual(prev, utc)
+
+    def test_following_previous_schedule_daily_dag_CEST_to_CET(self):
+        """
+        Make sure DST transitions are properly observed
+        """
+        local_tz = pendulum.timezone('Europe/Zurich')
+        start = local_tz.convert(datetime.datetime(2018, 10, 27, 3),
+                                 dst_rule=pendulum.PRE_TRANSITION)
+
+        utc = timezone.convert_to_utc(start)
+
+        dag = DAG('tz_dag', start_date=start, schedule_interval='0 3 * * *')
+
+        prev = dag.previous_schedule(utc)
+        prev_local = local_tz.convert(prev)
+
+        self.assertEqual(prev_local.isoformat(), "2018-10-26T03:00:00+02:00")
+        self.assertEqual(prev.isoformat(), "2018-10-26T01:00:00+00:00")
+
+        _next = dag.following_schedule(utc)
+        next_local = local_tz.convert(_next)
+
+        self.assertEqual(next_local.isoformat(), "2018-10-28T03:00:00+01:00")
+        self.assertEqual(_next.isoformat(), "2018-10-28T02:00:00+00:00")
+
+        prev = dag.previous_schedule(_next)
+        prev_local = local_tz.convert(prev)
+
+        self.assertEqual(prev_local.isoformat(), "2018-10-27T03:00:00+02:00")
+        self.assertEqual(prev.isoformat(), "2018-10-27T01:00:00+00:00")
+
+    def test_following_previous_schedule_daily_dag_CET_to_CEST(self):
+        """
+        Make sure DST transitions are properly observed
+        """
+        local_tz = pendulum.timezone('Europe/Zurich')
+        start = local_tz.convert(datetime.datetime(2018, 3, 25, 2),
+                                 dst_rule=pendulum.PRE_TRANSITION)
+
+        utc = timezone.convert_to_utc(start)
+
+        dag = DAG('tz_dag', start_date=start, schedule_interval='0 3 * * *')
+
+        prev = dag.previous_schedule(utc)
+        prev_local = local_tz.convert(prev)
+
+        self.assertEqual(prev_local.isoformat(), "2018-03-24T03:00:00+01:00")
+        self.assertEqual(prev.isoformat(), "2018-03-24T02:00:00+00:00")
+
+        _next = dag.following_schedule(utc)
+        next_local = local_tz.convert(_next)
+
+        self.assertEqual(next_local.isoformat(), "2018-03-25T03:00:00+02:00")
+        self.assertEqual(_next.isoformat(), "2018-03-25T01:00:00+00:00")
+
+        prev = dag.previous_schedule(_next)
+        prev_local = local_tz.convert(prev)
+
+        self.assertEqual(prev_local.isoformat(), "2018-03-24T03:00:00+01:00")
+        self.assertEqual(prev.isoformat(), "2018-03-24T02:00:00+00:00")
+
     @patch('airflow.models.timezone.utcnow')
     def test_sync_to_db(self, mock_now):
         dag = DAG(
@@ -603,81 +868,43 @@ class DagTest(unittest.TestCase):
         self.assertEqual(set(orm_dag.owners.split(', ')), {'owner1', 'owner2'})
         self.assertEqual(orm_dag.last_scheduler_run, now)
         self.assertTrue(orm_dag.is_active)
+        self.assertIsNone(orm_dag.default_view)
+        self.assertEqual(orm_dag.get_default_view(),
+                         configuration.conf.get('webserver', 'dag_default_view').lower())
+        self.assertEqual(orm_dag.safe_dag_id, 'dag')
 
         orm_subdag = session.query(DagModel).filter(
             DagModel.dag_id == 'dag.subtask').one()
         self.assertEqual(set(orm_subdag.owners.split(', ')), {'owner1', 'owner2'})
         self.assertEqual(orm_subdag.last_scheduler_run, now)
         self.assertTrue(orm_subdag.is_active)
+        self.assertEqual(orm_subdag.safe_dag_id, 'dag__dot__subtask')
 
-
-class DagStatTest(unittest.TestCase):
-    def test_dagstats_crud(self):
-        DagStat.create(dag_id='test_dagstats_crud')
-
-        session = settings.Session()
-        qry = session.query(DagStat).filter(DagStat.dag_id == 'test_dagstats_crud')
-        self.assertEqual(len(qry.all()), len(State.dag_states))
-
-        DagStat.set_dirty(dag_id='test_dagstats_crud')
-        res = qry.all()
-
-        for stat in res:
-            self.assertTrue(stat.dirty)
-
-        # create missing
-        DagStat.set_dirty(dag_id='test_dagstats_crud_2')
-        qry2 = session.query(DagStat).filter(DagStat.dag_id == 'test_dagstats_crud_2')
-        self.assertEqual(len(qry2.all()), len(State.dag_states))
-
+    @patch('airflow.models.timezone.utcnow')
+    def test_sync_to_db_default_view(self, mock_now):
         dag = DAG(
-            'test_dagstats_crud',
+            'dag',
             start_date=DEFAULT_DATE,
-            default_args={'owner': 'owner1'})
-
-        with dag:
-            op1 = DummyOperator(task_id='A')
-
-        now = timezone.utcnow()
-        dr = dag.create_dagrun(
-            run_id='manual__' + now.isoformat(),
-            execution_date=now,
-            start_date=now,
-            state=State.FAILED,
-            external_trigger=False,
+            default_view="graph",
         )
+        with dag:
+            DummyOperator(task_id='task', owner='owner1')
+            SubDagOperator(
+                task_id='subtask',
+                owner='owner2',
+                subdag=DAG(
+                    'dag.subtask',
+                    start_date=DEFAULT_DATE,
+                )
+            )
+        now = datetime.datetime.utcnow().replace(tzinfo=pendulum.timezone('UTC'))
+        mock_now.return_value = now
+        session = settings.Session()
+        dag.sync_to_db(session=session)
 
-        DagStat.update(dag_ids=['test_dagstats_crud'])
-        res = qry.all()
-        for stat in res:
-            if stat.state == State.FAILED:
-                self.assertEqual(stat.count, 1)
-            else:
-                self.assertEqual(stat.count, 0)
-
-        DagStat.update()
-        res = qry2.all()
-        for stat in res:
-            self.assertFalse(stat.dirty)
-
-    def test_update_exception(self):
-        session = Mock()
-        (session.query.return_value
-            .filter.return_value
-            .with_for_update.return_value
-            .all.side_effect) = RuntimeError('it broke')
-        DagStat.update(session=session)
-        session.rollback.assert_called()
-
-    def test_set_dirty_exception(self):
-        session = Mock()
-        session.query.return_value.filter.return_value.all.return_value = []
-        (session.query.return_value
-            .filter.return_value
-            .with_for_update.return_value
-            .all.side_effect) = RuntimeError('it broke')
-        DagStat.set_dirty('dag', session)
-        session.rollback.assert_called()
+        orm_dag = session.query(DagModel).filter(DagModel.dag_id == 'dag').one()
+        self.assertIsNotNone(orm_dag.default_view)
+        self.assertEqual(orm_dag.get_default_view(), "graph")
 
 
 class DagRunTest(unittest.TestCase):
@@ -732,7 +959,7 @@ class DagRunTest(unittest.TestCase):
             DagRun.dag_id == dag_id,
             DagRun.execution_date == now
         ).first()
-        self.assertEquals(dr0.state, State.RUNNING)
+        self.assertEqual(dr0.state, State.RUNNING)
 
     def test_id_for_date(self):
         run_id = models.DagRun.id_for_date(
@@ -914,8 +1141,8 @@ class DagRunTest(unittest.TestCase):
         dag = DAG('test_dagrun_no_deadlock',
                   start_date=DEFAULT_DATE)
         with dag:
-            op1 = DummyOperator(task_id='dop', depends_on_past=True)
-            op2 = DummyOperator(task_id='tc', task_concurrency=1)
+            DummyOperator(task_id='dop', depends_on_past=True)
+            DummyOperator(task_id='tc', task_concurrency=1)
 
         dag.clear()
         dr = dag.create_dagrun(run_id='test_dagrun_no_deadlock_1',
@@ -927,9 +1154,9 @@ class DagRunTest(unittest.TestCase):
                                 execution_date=DEFAULT_DATE + datetime.timedelta(days=1),
                                 start_date=DEFAULT_DATE + datetime.timedelta(days=1))
         ti1_op1 = dr.get_task_instance(task_id='dop')
-        ti2_op1 = dr2.get_task_instance(task_id='dop')
+        dr2.get_task_instance(task_id='dop')
         ti2_op1 = dr.get_task_instance(task_id='tc')
-        ti2_op2 = dr.get_task_instance(task_id='tc')
+        dr.get_task_instance(task_id='tc')
         ti1_op1.set_state(state=State.RUNNING, session=session)
         dr.update_state()
         dr2.update_state()
@@ -1130,7 +1357,7 @@ class DagRunTest(unittest.TestCase):
             dag_id='test_get_task_instance_on_empty_dagrun',
             start_date=timezone.datetime(2017, 1, 1)
         )
-        dag_task1 = ShortCircuitOperator(
+        ShortCircuitOperator(
             task_id='test_short_circuit_false',
             dag=dag,
             python_callable=lambda: False)
@@ -1160,10 +1387,8 @@ class DagRunTest(unittest.TestCase):
         dag = DAG(
             dag_id='test_latest_runs_1',
             start_date=DEFAULT_DATE)
-        dag_1_run_1 = self.create_dag_run(dag,
-                                          execution_date=timezone.datetime(2015, 1, 1))
-        dag_1_run_2 = self.create_dag_run(dag,
-                                          execution_date=timezone.datetime(2015, 1, 2))
+        self.create_dag_run(dag, execution_date=timezone.datetime(2015, 1, 1))
+        self.create_dag_run(dag, execution_date=timezone.datetime(2015, 1, 2))
         dagruns = models.DagRun.get_latest_runs(session)
         session.close()
         for dagrun in dagruns:
@@ -1196,20 +1421,20 @@ class DagRunTest(unittest.TestCase):
 
         dagrun = self.create_dag_run(dag)
         flaky_ti = dagrun.get_task_instances()[0]
-        self.assertEquals('flaky_task', flaky_ti.task_id)
-        self.assertEquals(State.NONE, flaky_ti.state)
+        self.assertEqual('flaky_task', flaky_ti.task_id)
+        self.assertEqual(State.NONE, flaky_ti.state)
 
         dagrun.dag = with_all_tasks_removed(dag)
 
         dagrun.verify_integrity()
         flaky_ti.refresh_from_db()
-        self.assertEquals(State.NONE, flaky_ti.state)
+        self.assertEqual(State.NONE, flaky_ti.state)
 
         dagrun.dag.add_task(DummyOperator(task_id='flaky_task', owner='test'))
 
         dagrun.verify_integrity()
         flaky_ti.refresh_from_db()
-        self.assertEquals(State.NONE, flaky_ti.state)
+        self.assertEqual(State.NONE, flaky_ti.state)
 
 
 class DagBagTest(unittest.TestCase):
@@ -1223,7 +1448,7 @@ class DagBagTest(unittest.TestCase):
 
     def test_get_existing_dag(self):
         """
-        test that were're able to parse some example DAGs and retrieve them
+        Test that we're able to parse some example DAGs and retrieve them
         """
         dagbag = models.DagBag(dag_folder=self.empty_dir, include_examples=True)
 
@@ -1315,9 +1540,9 @@ class DagBagTest(unittest.TestCase):
                 super(TestDagBag, self).process_file(filepath, only_if_updated, safe_mode)
 
         dagbag = TestDagBag(include_examples=True)
-        processed_files = dagbag.process_file_calls
+        dagbag.process_file_calls
 
-        # Should not call process_file agani, since it's already loaded during init.
+        # Should not call process_file again, since it's already loaded during init.
         self.assertEqual(1, dagbag.process_file_calls)
         self.assertIsNotNone(dagbag.get_dag(dag_id))
         self.assertEqual(1, dagbag.process_file_calls)
@@ -1364,12 +1589,12 @@ class DagBagTest(unittest.TestCase):
 
         for dag_id in expected_dag_ids:
             actual_dagbag.log.info('validating %s' % dag_id)
-            self.assertEquals(
+            self.assertEqual(
                 dag_id in actual_found_dag_ids, should_be_found,
                 'dag "%s" should %shave been found after processing dag "%s"' %
                 (dag_id, '' if should_be_found else 'not ', expected_parent_dag.dag_id)
             )
-            self.assertEquals(
+            self.assertEqual(
                 dag_id in actual_dagbag.dags, should_be_found,
                 'dag "%s" should %sbe in dagbag.dags after processing dag "%s"' %
                 (dag_id, '' if should_be_found else 'not ', expected_parent_dag.dag_id)
@@ -1667,34 +1892,62 @@ class DagBagTest(unittest.TestCase):
         self.assertEqual([], dagbag.process_file(None))
 
     @patch.object(TI, 'handle_failure')
-    def test_kill_zombies(self, mock_ti):
+    def test_kill_zombies(self, mock_ti_handle_failure):
         """
         Test that kill zombies call TIs failure handler with proper context
         """
         dagbag = models.DagBag()
+        with create_session() as session:
+            session.query(TI).delete()
+            dag = dagbag.get_dag('example_branch_operator')
+            task = dag.get_task(task_id='run_this_first')
+
+            ti = TI(task, DEFAULT_DATE, State.RUNNING)
+
+            session.add(ti)
+            session.commit()
+
+            zombies = [SimpleTaskInstance(ti)]
+            dagbag.kill_zombies(zombies)
+            mock_ti_handle_failure \
+                .assert_called_with(ANY,
+                                    configuration.getboolean('core',
+                                                             'unit_test_mode'),
+                                    ANY)
+
+    def test_deactivate_unknown_dags(self):
+        """
+        Test that dag_ids not passed into deactivate_unknown_dags
+        are deactivated when function is invoked
+        """
+        dagbag = models.DagBag(include_examples=True)
+        expected_active_dags = dagbag.dags.keys()
+
         session = settings.Session
-        dag = dagbag.get_dag('example_branch_operator')
-        task = dag.get_task(task_id='run_this_first')
-
-        ti = TI(task, datetime.datetime.now() - datetime.timedelta(1), 'running')
-        lj = LocalTaskJob(ti)
-        lj.state = State.SHUTDOWN
-
-        session.add(lj)
+        session.add(DagModel(dag_id='test_deactivate_unknown_dags', is_active=True))
         session.commit()
 
-        ti.job_id = lj.id
+        models.DAG.deactivate_unknown_dags(expected_active_dags)
 
-        session.add(ti)
+        for dag in session.query(DagModel).all():
+            if dag.dag_id in expected_active_dags:
+                self.assertTrue(dag.is_active)
+            else:
+                self.assertEqual(dag.dag_id, 'test_deactivate_unknown_dags')
+                self.assertFalse(dag.is_active)
+
+        # clean up
+        session.query(DagModel).filter(DagModel.dag_id == 'test_deactivate_unknown_dags').delete()
         session.commit()
-
-        dagbag.kill_zombies()
-        mock_ti.assert_called_with(ANY,
-                                   configuration.getboolean('core', 'unit_test_mode'),
-                                   ANY)
 
 
 class TaskInstanceTest(unittest.TestCase):
+
+    def tearDown(self):
+        with create_session() as session:
+            session.query(models.TaskFail).delete()
+            session.query(models.TaskReschedule).delete()
+            session.query(models.TaskInstance).delete()
 
     def test_set_task_dates(self):
         """
@@ -1742,7 +1995,7 @@ class TaskInstanceTest(unittest.TestCase):
         op_no_dag = DummyOperator(task_id='op_no_dag')
         ti = TI(task=op_no_dag, execution_date=NAIVE_DATETIME)
 
-        self.assertEquals(ti.execution_date, DEFAULT_DATE)
+        self.assertEqual(ti.execution_date, DEFAULT_DATE)
 
         # check with dag without localized execution_date
         dag = DAG('dag', start_date=DEFAULT_DATE)
@@ -1750,14 +2003,14 @@ class TaskInstanceTest(unittest.TestCase):
         dag.add_task(op1)
         ti = TI(task=op1, execution_date=NAIVE_DATETIME)
 
-        self.assertEquals(ti.execution_date, DEFAULT_DATE)
+        self.assertEqual(ti.execution_date, DEFAULT_DATE)
 
         # with dag and localized execution_date
         tz = pendulum.timezone("Europe/Amsterdam")
         execution_date = timezone.datetime(2016, 1, 1, 1, 0, 0, tzinfo=tz)
         utc_date = timezone.convert_to_utc(execution_date)
         ti = TI(task=op1, execution_date=execution_date)
-        self.assertEquals(ti.execution_date, utc_date)
+        self.assertEqual(ti.execution_date, utc_date)
 
     def test_task_naive_datetime(self):
         NAIVE_DATETIME = DEFAULT_DATE.replace(tzinfo=None)
@@ -2066,6 +2319,102 @@ class TaskInstanceTest(unittest.TestCase):
         dt = ti.next_retry_datetime()
         self.assertEqual(dt, ti.end_date + max_delay)
 
+    @patch.object(TI, 'pool_full')
+    def test_reschedule_handling(self, mock_pool_full):
+        """
+        Test that task reschedules are handled properly
+        """
+        # Mock the pool with a pool with slots open since the pool doesn't actually exist
+        mock_pool_full.return_value = False
+
+        # Return values of the python sensor callable, modified during tests
+        done = False
+        fail = False
+
+        def callable():
+            if fail:
+                raise AirflowException()
+            return done
+
+        dag = models.DAG(dag_id='test_reschedule_handling')
+        task = PythonSensor(
+            task_id='test_reschedule_handling_sensor',
+            poke_interval=0,
+            mode='reschedule',
+            python_callable=callable,
+            retries=1,
+            retry_delay=datetime.timedelta(seconds=0),
+            dag=dag,
+            owner='airflow',
+            start_date=timezone.datetime(2016, 2, 1, 0, 0, 0))
+
+        ti = TI(task=task, execution_date=timezone.utcnow())
+        self.assertEqual(ti._try_number, 0)
+        self.assertEqual(ti.try_number, 1)
+
+        def run_ti_and_assert(run_date, expected_start_date, expected_end_date, expected_duration,
+                              expected_state, expected_try_number, expected_task_reschedule_count):
+            with freeze_time(run_date):
+                try:
+                    ti.run()
+                except AirflowException:
+                    if not fail:
+                        raise
+            ti.refresh_from_db()
+            self.assertEqual(ti.state, expected_state)
+            self.assertEqual(ti._try_number, expected_try_number)
+            self.assertEqual(ti.try_number, expected_try_number + 1)
+            self.assertEqual(ti.start_date, expected_start_date)
+            self.assertEqual(ti.end_date, expected_end_date)
+            self.assertEqual(ti.duration, expected_duration)
+            trs = TR.find_for_task_instance(ti)
+            self.assertEqual(len(trs), expected_task_reschedule_count)
+
+        date1 = timezone.utcnow()
+        date2 = date1 + datetime.timedelta(minutes=1)
+        date3 = date2 + datetime.timedelta(minutes=1)
+        date4 = date3 + datetime.timedelta(minutes=1)
+
+        # Run with multiple reschedules.
+        # During reschedule the try number remains the same, but each reschedule is recorded.
+        # The start date is expected to remain the inital date, hence the duration increases.
+        # When finished the try number is incremented and there is no reschedule expected
+        # for this try.
+
+        done, fail = False, False
+        run_ti_and_assert(date1, date1, date1, 0, State.UP_FOR_RESCHEDULE, 0, 1)
+
+        done, fail = False, False
+        run_ti_and_assert(date2, date1, date2, 60, State.UP_FOR_RESCHEDULE, 0, 2)
+
+        done, fail = False, False
+        run_ti_and_assert(date3, date1, date3, 120, State.UP_FOR_RESCHEDULE, 0, 3)
+
+        done, fail = True, False
+        run_ti_and_assert(date4, date1, date4, 180, State.SUCCESS, 1, 0)
+
+        # Clear the task instance.
+        dag.clear()
+        ti.refresh_from_db()
+        self.assertEqual(ti.state, State.NONE)
+        self.assertEqual(ti._try_number, 1)
+
+        # Run again after clearing with reschedules and a retry.
+        # The retry increments the try number, and for that try no reschedule is expected.
+        # After the retry the start date is reset, hence the duration is also reset.
+
+        done, fail = False, False
+        run_ti_and_assert(date1, date1, date1, 0, State.UP_FOR_RESCHEDULE, 1, 1)
+
+        done, fail = False, True
+        run_ti_and_assert(date2, date1, date2, 60, State.UP_FOR_RETRY, 2, 0)
+
+        done, fail = False, False
+        run_ti_and_assert(date3, date3, date3, 0, State.UP_FOR_RESCHEDULE, 2, 1)
+
+        done, fail = True, False
+        run_ti_and_assert(date4, date3, date4, 60, State.SUCCESS, 3, 0)
+
     def test_depends_on_past(self):
         dagbag = models.DagBag()
         dag = dagbag.get_dag('test_depends_on_past')
@@ -2266,6 +2615,32 @@ class TaskInstanceTest(unittest.TestCase):
                                       include_prior_dates=True),
                          value)
 
+    def test_xcom_push_flag(self):
+        """
+        Tests the option for Operators to push XComs
+        """
+        value = 'hello'
+        task_id = 'test_no_xcom_push'
+        dag = models.DAG(dag_id='test_xcom')
+
+        # nothing saved to XCom
+        task = PythonOperator(
+            task_id=task_id,
+            dag=dag,
+            python_callable=lambda: value,
+            do_xcom_push=False,
+            owner='airflow',
+            start_date=datetime.datetime(2017, 1, 1)
+        )
+        ti = TI(task=task, execution_date=datetime.datetime(2017, 1, 1))
+        ti.run()
+        self.assertEqual(
+            ti.xcom_pull(
+                task_ids=task_id, key=models.XCOM_RETURN_KEY
+            ),
+            None
+        )
+
     def test_post_execute_hook(self):
         """
         Test that post_execute hook is called with the Operator's result.
@@ -2345,24 +2720,23 @@ class TaskInstanceTest(unittest.TestCase):
         session.add(ti3)
         session.commit()
 
-        self.assertEquals(1, ti1.get_num_running_task_instances(session=session))
-        self.assertEquals(1, ti2.get_num_running_task_instances(session=session))
-        self.assertEquals(1, ti3.get_num_running_task_instances(session=session))
+        self.assertEqual(1, ti1.get_num_running_task_instances(session=session))
+        self.assertEqual(1, ti2.get_num_running_task_instances(session=session))
+        self.assertEqual(1, ti3.get_num_running_task_instances(session=session))
+
+    # def test_log_url(self):
+    #     now = pendulum.now('Europe/Brussels')
+    #     dag = DAG('dag', start_date=DEFAULT_DATE)
+    #     task = DummyOperator(task_id='op', dag=dag)
+    #     ti = TI(task=task, execution_date=now)
+    #     d = urllib.parse.parse_qs(
+    #         urllib.parse.urlparse(ti.log_url).query,
+    #         keep_blank_values=True, strict_parsing=True)
+    #     self.assertEqual(d['dag_id'][0], 'dag')
+    #     self.assertEqual(d['task_id'][0], 'op')
+    #     self.assertEqual(pendulum.parse(d['execution_date'][0]), now)
 
     def test_log_url(self):
-        now = pendulum.now('Europe/Brussels')
-        dag = DAG('dag', start_date=DEFAULT_DATE)
-        task = DummyOperator(task_id='op', dag=dag)
-        ti = TI(task=task, execution_date=now)
-        d = urllib.parse.parse_qs(
-            urllib.parse.urlparse(ti.log_url).query,
-            keep_blank_values=True, strict_parsing=True)
-        self.assertEqual(d['dag_id'][0], 'dag')
-        self.assertEqual(d['task_id'][0], 'op')
-        self.assertEqual(pendulum.parse(d['execution_date'][0]), now)
-
-    @patch('airflow.settings.RBAC', True)
-    def test_log_url_rbac(self):
         dag = DAG('dag', start_date=DEFAULT_DATE)
         task = DummyOperator(task_id='op', dag=dag)
         ti = TI(task=task, execution_date=datetime.datetime(2018, 1, 1))
@@ -2419,15 +2793,53 @@ class TaskInstanceTest(unittest.TestCase):
 
     @patch('airflow.models.send_email')
     def test_email_alert(self, mock_send_email):
-        task = DummyOperator(task_id='op', email='test@test.test')
-        ti = TI(task=task, execution_date=datetime.datetime.now())
-        ti.email_alert(RuntimeError('it broke'))
+        dag = models.DAG(dag_id='test_failure_email')
+        task = BashOperator(
+            task_id='test_email_alert',
+            dag=dag,
+            bash_command='exit 1',
+            start_date=DEFAULT_DATE,
+            email='to')
 
-        self.assertTrue(mock_send_email.called)
+        ti = TI(task=task, execution_date=datetime.datetime.now())
+
+        try:
+            ti.run()
+        except AirflowException:
+            pass
+
         (email, title, body), _ = mock_send_email.call_args
-        self.assertEqual(email, 'test@test.test')
-        self.assertIn(repr(ti), title)
-        self.assertIn('it broke', body)
+        self.assertEqual(email, 'to')
+        self.assertIn('test_email_alert', title)
+        self.assertIn('test_email_alert', body)
+
+    @patch('airflow.models.send_email')
+    def test_email_alert_with_config(self, mock_send_email):
+        dag = models.DAG(dag_id='test_failure_email')
+        task = BashOperator(
+            task_id='test_email_alert_with_config',
+            dag=dag,
+            bash_command='exit 1',
+            start_date=DEFAULT_DATE,
+            email='to')
+
+        ti = TI(
+            task=task, execution_date=datetime.datetime.now())
+
+        configuration.set('email', 'SUBJECT_TEMPLATE', '/subject/path')
+        configuration.set('email', 'HTML_CONTENT_TEMPLATE', '/html_content/path')
+
+        opener = mock_open(read_data='template: {{ti.task_id}}')
+        with patch('airflow.models.open', opener, create=True):
+            try:
+                ti.run()
+            except AirflowException:
+                pass
+
+        (email, title, body), _ = mock_send_email.call_args
+        self.assertEqual(email, 'to')
+        self.assertEqual('template: test_email_alert_with_config', title)
+        self.assertEqual('template: test_email_alert_with_config', body)
 
     def test_set_duration(self):
         task = DummyOperator(task_id='op', email='test@test.test')
@@ -2445,6 +2857,40 @@ class TaskInstanceTest(unittest.TestCase):
         ti = TI(task=task, execution_date=datetime.datetime.now())
         ti.set_duration()
         self.assertIsNone(ti.duration)
+
+    def test_success_callbak_no_race_condition(self):
+        class CallbackWrapper(object):
+            def wrap_task_instance(self, ti):
+                self.task_id = ti.task_id
+                self.dag_id = ti.dag_id
+                self.execution_date = ti.execution_date
+                self.task_state_in_callback = ""
+                self.callback_ran = False
+
+            def success_handler(self, context):
+                self.callback_ran = True
+                session = settings.Session()
+                temp_instance = session.query(TI).filter(
+                    TI.task_id == self.task_id).filter(
+                    TI.dag_id == self.dag_id).filter(
+                    TI.execution_date == self.execution_date).one()
+                self.task_state_in_callback = temp_instance.state
+        cw = CallbackWrapper()
+        dag = DAG('test_success_callbak_no_race_condition', start_date=DEFAULT_DATE,
+                  end_date=DEFAULT_DATE + datetime.timedelta(days=10))
+        task = DummyOperator(task_id='op', email='test@test.test',
+                             on_success_callback=cw.success_handler, dag=dag)
+        ti = TI(task=task, execution_date=datetime.datetime.now())
+        ti.state = State.RUNNING
+        session = settings.Session()
+        session.merge(ti)
+        session.commit()
+        cw.wrap_task_instance(ti)
+        ti._run_raw_task()
+        self.assertTrue(cw.callback_ran)
+        self.assertEqual(cw.task_state_in_callback, State.RUNNING)
+        ti.refresh_from_db()
+        self.assertEqual(ti.state, State.SUCCESS)
 
 
 class ClearTasksTest(unittest.TestCase):
@@ -2756,28 +3202,118 @@ class ClearTasksTest(unittest.TestCase):
             self.assertEqual(result.value, json_obj)
 
 
+class VariableTest(unittest.TestCase):
+    def setUp(self):
+        models._fernet = None
+
+    def tearDown(self):
+        models._fernet = None
+
+    @patch('airflow.models.configuration.conf.get')
+    def test_variable_no_encryption(self, mock_get):
+        """
+        Test variables without encryption
+        """
+        mock_get.return_value = ''
+        Variable.set('key', 'value')
+        session = settings.Session()
+        test_var = session.query(Variable).filter(Variable.key == 'key').one()
+        self.assertFalse(test_var.is_encrypted)
+        self.assertEqual(test_var.val, 'value')
+
+    @patch('airflow.models.configuration.conf.get')
+    def test_variable_with_encryption(self, mock_get):
+        """
+        Test variables with encryption
+        """
+        mock_get.return_value = Fernet.generate_key().decode()
+        Variable.set('key', 'value')
+        session = settings.Session()
+        test_var = session.query(Variable).filter(Variable.key == 'key').one()
+        self.assertTrue(test_var.is_encrypted)
+        self.assertEqual(test_var.val, 'value')
+
+    @patch('airflow.models.configuration.conf.get')
+    def test_var_with_encryption_rotate_fernet_key(self, mock_get):
+        """
+        Tests rotating encrypted variables.
+        """
+        key1 = Fernet.generate_key()
+        key2 = Fernet.generate_key()
+
+        mock_get.return_value = key1.decode()
+        Variable.set('key', 'value')
+        session = settings.Session()
+        test_var = session.query(Variable).filter(Variable.key == 'key').one()
+        self.assertTrue(test_var.is_encrypted)
+        self.assertEqual(test_var.val, 'value')
+        self.assertEqual(Fernet(key1).decrypt(test_var._val.encode()), b'value')
+
+        # Test decrypt of old value with new key
+        mock_get.return_value = ','.join([key2.decode(), key1.decode()])
+        models._fernet = None
+        self.assertEqual(test_var.val, 'value')
+
+        # Test decrypt of new value with new key
+        test_var.rotate_fernet_key()
+        self.assertTrue(test_var.is_encrypted)
+        self.assertEqual(test_var.val, 'value')
+        self.assertEqual(Fernet(key2).decrypt(test_var._val.encode()), b'value')
+
+
 class ConnectionTest(unittest.TestCase):
-    @patch.object(configuration, 'get')
+    def setUp(self):
+        models._fernet = None
+
+    def tearDown(self):
+        models._fernet = None
+
+    @patch('airflow.models.configuration.conf.get')
     def test_connection_extra_no_encryption(self, mock_get):
         """
         Tests extras on a new connection without encryption. The fernet key
         is set to a non-base64-encoded string and the extra is stored without
         encryption.
         """
-        mock_get.return_value = 'cryptography_not_found_storing_passwords_in_plain_text'
+        mock_get.return_value = ''
         test_connection = Connection(extra='testextra')
+        self.assertFalse(test_connection.is_extra_encrypted)
         self.assertEqual(test_connection.extra, 'testextra')
 
-    @patch.object(configuration, 'get')
+    @patch('airflow.models.configuration.conf.get')
     def test_connection_extra_with_encryption(self, mock_get):
         """
-        Tests extras on a new connection with encryption. The fernet key
-        is set to a base64 encoded string and the extra is encrypted.
+        Tests extras on a new connection with encryption.
         """
-        # 'dGVzdA==' is base64 encoded 'test'
-        mock_get.return_value = 'dGVzdA=='
+        mock_get.return_value = Fernet.generate_key().decode()
         test_connection = Connection(extra='testextra')
+        self.assertTrue(test_connection.is_extra_encrypted)
         self.assertEqual(test_connection.extra, 'testextra')
+
+    @patch('airflow.models.configuration.conf.get')
+    def test_connection_extra_with_encryption_rotate_fernet_key(self, mock_get):
+        """
+        Tests rotating encrypted extras.
+        """
+        key1 = Fernet.generate_key()
+        key2 = Fernet.generate_key()
+
+        mock_get.return_value = key1.decode()
+        test_connection = Connection(extra='testextra')
+        self.assertTrue(test_connection.is_extra_encrypted)
+        self.assertEqual(test_connection.extra, 'testextra')
+        self.assertEqual(Fernet(key1).decrypt(test_connection._extra.encode()), b'testextra')
+
+        # Test decrypt of old value with new key
+        mock_get.return_value = ','.join([key2.decode(), key1.decode()])
+        models._fernet = None
+        self.assertEqual(test_connection.extra, 'testextra')
+
+        # Test decrypt of new value with new key
+        test_connection.rotate_fernet_key()
+        self.assertTrue(test_connection.is_extra_encrypted)
+        self.assertEqual(test_connection.extra, 'testextra')
+        self.assertEqual(Fernet(key2).decrypt(test_connection._extra.encode()), b'testextra')
 
     def test_connection_from_uri_without_extras(self):
         uri = 'scheme://user:password@host%2flocation:1234/schema'
@@ -2802,6 +3338,59 @@ class ConnectionTest(unittest.TestCase):
         self.assertEqual(connection.port, 1234)
         self.assertDictEqual(connection.extra_dejson, {'extra1': 'a value',
                                                        'extra2': '/path/'})
+
+    def test_connection_from_uri_with_colon_in_hostname(self):
+        uri = 'scheme://user:password@host%2flocation%3ax%3ay:1234/schema?' \
+              'extra1=a%20value&extra2=%2fpath%2f'
+        connection = Connection(uri=uri)
+        self.assertEqual(connection.conn_type, 'scheme')
+        self.assertEqual(connection.host, 'host/location:x:y')
+        self.assertEqual(connection.schema, 'schema')
+        self.assertEqual(connection.login, 'user')
+        self.assertEqual(connection.password, 'password')
+        self.assertEqual(connection.port, 1234)
+        self.assertDictEqual(connection.extra_dejson, {'extra1': 'a value',
+                                                       'extra2': '/path/'})
+
+    def test_connection_from_uri_with_encoded_password(self):
+        uri = 'scheme://user:password%20with%20space@host%2flocation%3ax%3ay:1234/schema'
+        connection = Connection(uri=uri)
+        self.assertEqual(connection.conn_type, 'scheme')
+        self.assertEqual(connection.host, 'host/location:x:y')
+        self.assertEqual(connection.schema, 'schema')
+        self.assertEqual(connection.login, 'user')
+        self.assertEqual(connection.password, 'password with space')
+        self.assertEqual(connection.port, 1234)
+
+    def test_connection_from_uri_with_encoded_user(self):
+        uri = 'scheme://domain%2fuser:password@host%2flocation%3ax%3ay:1234/schema'
+        connection = Connection(uri=uri)
+        self.assertEqual(connection.conn_type, 'scheme')
+        self.assertEqual(connection.host, 'host/location:x:y')
+        self.assertEqual(connection.schema, 'schema')
+        self.assertEqual(connection.login, 'domain/user')
+        self.assertEqual(connection.password, 'password')
+        self.assertEqual(connection.port, 1234)
+
+    def test_connection_from_uri_with_encoded_schema(self):
+        uri = 'scheme://user:password%20with%20space@host:1234/schema%2ftest'
+        connection = Connection(uri=uri)
+        self.assertEqual(connection.conn_type, 'scheme')
+        self.assertEqual(connection.host, 'host')
+        self.assertEqual(connection.schema, 'schema/test')
+        self.assertEqual(connection.login, 'user')
+        self.assertEqual(connection.password, 'password with space')
+        self.assertEqual(connection.port, 1234)
+
+    def test_connection_from_uri_no_schema(self):
+        uri = 'scheme://user:password%20with%20space@host:1234'
+        connection = Connection(uri=uri)
+        self.assertEqual(connection.conn_type, 'scheme')
+        self.assertEqual(connection.host, 'host')
+        self.assertEqual(connection.schema, '')
+        self.assertEqual(connection.login, 'user')
+        self.assertEqual(connection.password, 'password with space')
+        self.assertEqual(connection.port, 1234)
 
 
 class TestSkipMixin(unittest.TestCase):

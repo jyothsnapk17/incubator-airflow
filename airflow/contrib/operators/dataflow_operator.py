@@ -187,6 +187,7 @@ class DataflowTemplateOperator(BaseOperator):
        default_args = {
            'dataflow_default_options': {
                'project': 'my-gcp-project',
+               'region': 'europe-west1',
                'zone': 'europe-west1-d',
                'tempLocation': 'gs://my-staging-bucket/staging/',
                }
@@ -271,7 +272,7 @@ class DataFlowPythonOperator(BaseOperator):
         For more detail on job submission have a look at the reference:
         https://cloud.google.com/dataflow/pipelines/specifying-exec-params
 
-    :param py_file: Reference to the python dataflow pipleline file.py, e.g.,
+    :param py_file: Reference to the python dataflow pipeline file.py, e.g.,
         /some/local/file/path/to/your/python/pipeline/file.
     :type py_file: str
     :param job_name: The 'job_name' to use when executing the DataFlow job

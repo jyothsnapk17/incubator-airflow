@@ -19,7 +19,6 @@
 # under the License.
 
 from __future__ import print_function
-from backports.configparser import NoSectionError
 import logging
 
 import os
@@ -35,6 +34,7 @@ import argparse
 from builtins import input
 from operator import attrgetter
 from collections import namedtuple
+
 from airflow.utils.timezone import parse as parsedate
 import json
 from tabulate import tabulate
@@ -56,22 +56,16 @@ from airflow import jobs, settings
 from airflow import configuration as conf
 from airflow.exceptions import AirflowException, AirflowWebServerTimeout
 from airflow.executors import GetDefaultExecutor
-from airflow.models import (DagModel, DagBag, TaskInstance,
-                            DagPickle, DagRun, Variable, DagStat,
-                            Connection, DAG)
-
+from airflow.models import DagModel, DagBag, TaskInstance, DagRun, Variable, DAG
+from airflow.models.connection import Connection
+from airflow.models.dagpickle import DagPickle
 from airflow.ti_deps.dep_context import (DepContext, SCHEDULER_DEPS)
-from airflow.utils import cli as cli_utils
-from airflow.utils import db as db_utils
+from airflow.utils import cli as cli_utils, db
 from airflow.utils.net import get_hostname
 from airflow.utils.log.logging_mixin import (LoggingMixin, redirect_stderr,
                                              redirect_stdout)
-from airflow.www.app import (cached_app, create_app)
-from airflow.www_rbac.app import cached_app as cached_app_rbac
-from airflow.www_rbac.app import create_app as create_app_rbac
-from airflow.www_rbac.app import cached_appbuilder
+from airflow.www.app import cached_app, create_app, cached_appbuilder
 
-from sqlalchemy import func
 from sqlalchemy.orm import exc
 
 api.load_auth()
@@ -367,10 +361,8 @@ def variables(args):
         except ValueError as e:
             log.error(e)
     if args.delete:
-        session = settings.Session()
-        session.query(Variable).filter_by(key=args.delete).delete()
-        session.commit()
-        session.close()
+        with db.create_session() as session:
+            session.query(Variable).filter_by(key=args.delete).delete()
     if args.set:
         Variable.set(args.set[0], args.set[1])
     # Work around 'import' as a reserved keyword
@@ -382,6 +374,12 @@ def variables(args):
             log.error("Missing variables file.")
     if args.export:
         export_helper(args.export)
+    if not (args.set or args.get or imp or args.export or args.delete):
+        # list all variables
+        with db.create_session() as session:
+            vars = session.query(Variable)
+            msg = "\n".join(var.key for var in vars)
+            print(msg)
 
 
 def import_helper(filepath):
@@ -408,19 +406,17 @@ def import_helper(filepath):
 
 
 def export_helper(filepath):
-    session = settings.Session()
-    qry = session.query(Variable).all()
-    session.close()
-
     var_dict = {}
-    d = json.JSONDecoder()
-    for var in qry:
-        val = None
-        try:
-            val = d.decode(var.val)
-        except Exception:
-            val = var.val
-        var_dict[var.key] = val
+    with db.create_session() as session:
+        qry = session.query(Variable).all()
+
+        d = json.JSONDecoder()
+        for var in qry:
+            try:
+                val = d.decode(var.val)
+            except Exception:
+                val = var.val
+            var_dict[var.key] = val
 
     with open(filepath, 'w') as varfile:
         varfile.write(json.dumps(var_dict, sort_keys=True, indent=4))
@@ -441,15 +437,15 @@ def set_is_paused(is_paused, args, dag=None):
     log = LoggingMixin().log
     dag = dag or get_dag(args)
 
-    session = settings.Session()
-    dm = session.query(DagModel).filter(
-        DagModel.dag_id == dag.dag_id).first()
-    dm.is_paused = is_paused
-    session.commit()
+    with db.create_session() as session:
+        dm = session.query(DagModel).filter(DagModel.dag_id == dag.dag_id).first()
+        dm.is_paused = is_paused
+        session.commit()
 
-    log.info("\n%s" % tabulate([(dag.dag_id, bool(dag.is_paused))],
-                            headers=['DAG ID', 'PAUSED'],
-                            tablefmt="fancy_grid"))
+    # log.info("\n%s" % tabulate([(dag.dag_id, bool(dag.is_paused))],
+    #                         headers=['DAG ID', 'PAUSED'],
+    #                         tablefmt="fancy_grid"))
+    print("Dag: {}, paused: {}".format(dag, str(dag.is_paused)))
 
 
 def _run(args, dag, ti):
@@ -475,14 +471,12 @@ def _run(args, dag, ti):
         if args.ship_dag:
             try:
                 # Running remotely, so pickling the DAG
-                session = settings.Session()
-                pickle = DagPickle(dag)
-                session.add(pickle)
-                session.commit()
-                pickle_id = pickle.id
-                # TODO: This should be written to a log
-                print('Pickled dag {dag} as pickle_id:{pickle_id}'
-                      .format(**locals()))
+                with db.create_session() as session:
+                    pickle = DagPickle(dag)
+                    session.add(pickle)
+                    pickle_id = pickle.id
+                    # TODO: This should be written to a log
+                    print('Pickled dag {dag} as pickle_id:{pickle_id}'.format(**locals()))
             except Exception as e:
                 print('Could not pickle the DAG')
                 print(e)
@@ -506,24 +500,6 @@ def _run(args, dag, ti):
 
 @cli_utils.action_logging
 def run(args, dag=None):
-    # Optional sections won't log an error if they're missing in airflow.cfg.
-    OPTIONAL_AIRFLOW_CFG_SECTIONS = [
-        'atlas',
-        'celery',
-        'celery_broker_transport_options',
-        'dask',
-        'elasticsearch',
-        'github_enterprise',
-        'hive',
-        'kerberos',
-        'kubernetes',
-        'kubernetes_node_selectors',
-        'kubernetes_secrets',
-        'ldap',
-        'lineage',
-        'mesos',
-    ]
-
     if dag:
         args.dag_id = dag.dag_id
 
@@ -537,25 +513,7 @@ def run(args, dag=None):
         if os.path.exists(args.cfg_path):
             os.remove(args.cfg_path)
 
-        # Do not log these properties since some may contain passwords.
-        # This may also set default values for database properties like
-        # core.sql_alchemy_pool_size
-        # core.sql_alchemy_pool_recycle
-        for section, config in conf_dict.items():
-            for option, value in config.items():
-                try:
-                    conf.set(section, option, value)
-                except NoSectionError:
-                    no_section_msg = (
-                        'Section {section} Option {option} '
-                        'does not exist in the config!'
-                    ).format(section=section, option=option)
-
-                    if section in OPTIONAL_AIRFLOW_CFG_SECTIONS:
-                        log.debug(no_section_msg)
-                    else:
-                        log.error(no_section_msg)
-
+        conf.conf.read_dict(conf_dict, source=args.cfg_path)
         settings.configure_vars()
 
     # IMPORTANT, have to use the NullPool, otherwise, each "run" command may leave
@@ -567,13 +525,12 @@ def run(args, dag=None):
     if not args.pickle and not dag:
         dag = get_dag(args)
     elif not dag:
-        session = settings.Session()
-        log.info('Loading pickle id {args.pickle}'.format(args=args))
-        dag_pickle = session.query(
-            DagPickle).filter(DagPickle.id == args.pickle).first()
-        if not dag_pickle:
-            raise AirflowException("Who hid the pickle!? [missing pickle]")
-        dag = dag_pickle.pickle
+        with db.create_session() as session:
+            log.info('Loading pickle id {args.pickle}'.format(args=args))
+            dag_pickle = session.query(DagPickle).filter(DagPickle.id == args.pickle).first()
+            if not dag_pickle:
+                raise AirflowException("Who hid the pickle!? [missing pickle]")
+            dag = dag_pickle.pickle
 
     task = dag.get_task(task_id=args.task_id)
     ti = TaskInstance(task, args.execution_date)
@@ -690,6 +647,17 @@ def next_execution(args):
 
 
 @cli_utils.action_logging
+def rotate_fernet_key(args):
+    session = settings.Session()
+    for conn in session.query(Connection).filter(
+            Connection.is_encrypted | Connection.is_extra_encrypted):
+        conn.rotate_fernet_key()
+    for var in session.query(Variable).filter(Variable.is_encrypted):
+        var.rotate_fernet_key()
+    session.commit()
+
+
+@cli_utils.action_logging
 def list_dags(args):
     log = LoggingMixin().log
 
@@ -726,6 +694,11 @@ def list_tasks(args, dag=None):
 
 @cli_utils.action_logging
 def test(args, dag=None):
+    # We want log outout from operators etc to show up here. Normally
+    # airflow.task would redirect to a file, but here we want it to propagate
+    # up to the normal airflow handler.
+    logging.getLogger('airflow.task').propagate = True
+
     dag = dag or get_dag(args)
 
     task = dag.get_task(task_id=args.task_id)
@@ -933,16 +906,13 @@ def webserver(args):
         print(
             "Starting the web server on port {0} and host {1}.".format(
                 args.port, args.hostname))
-        if settings.RBAC:
-            app, _ = create_app_rbac(conf, testing=conf.get('core', 'unit_test_mode'))
-        else:
-            app = create_app(conf, testing=conf.get('core', 'unit_test_mode'))
+        app, _ = create_app(conf, testing=conf.get('core', 'unit_test_mode'))
         app.run(debug=True, use_reloader=False if app.config['TESTING'] else True,
                 port=args.port, host=args.hostname,
                 ssl_context=(ssl_cert, ssl_key) if ssl_cert and ssl_key else None)
     else:
         os.environ['SKIP_DAGS_PARSING'] = 'True'
-        app = cached_app_rbac(conf) if settings.RBAC else cached_app(conf)
+        app = cached_app(conf)
         pid, stdout, stderr, log_file = setup_locations(
             "webserver", args.pid, args.stdout, args.stderr, args.log_file)
         os.environ.pop('SKIP_DAGS_PARSING')
@@ -969,7 +939,6 @@ def webserver(args):
             '-b', args.hostname + ':' + str(args.port),
             '-n', 'airflow-webserver',
             '-p', str(pid),
-            '-c', 'python:airflow.www.gunicorn_config',
         ]
 
         if args.access_logfile:
@@ -984,7 +953,7 @@ def webserver(args):
         if ssl_cert:
             run_args += ['--certfile', ssl_cert, '--keyfile', ssl_key]
 
-        webserver_module = 'www_rbac' if settings.RBAC else 'www'
+        webserver_module = 'www'
         run_args += ["airflow." + webserver_module + ".app:cached_app()"]
 
         gunicorn_master_proc = None
@@ -1051,7 +1020,6 @@ def scheduler(args):
     job = jobs.SchedulerJob(
         dag_id=args.dag_id,
         subdir=process_subdir(args.subdir),
-        run_duration=args.run_duration,
         num_runs=args.num_runs,
         do_pickle=args.do_pickle)
 
@@ -1090,7 +1058,7 @@ def serve_logs(args):
     flask_app = flask.Flask(__name__)
 
     @flask_app.route('/log/<path:filename>')
-    def serve_logs(filename):  # noqa
+    def serve_logs(filename):
         log = os.path.expanduser(conf.get('core', 'BASE_LOG_FOLDER'))
         return flask.send_from_directory(
             log,
@@ -1118,14 +1086,22 @@ def worker(args):
     from airflow.executors.celery_executor import app as celery_app
     from celery.bin import worker
 
+    autoscale = args.autoscale
+    if autoscale is None and conf.has_option("celery", "worker_autoscale"):
+        autoscale = conf.get("celery", "worker_autoscale")
     worker = worker.worker(app=celery_app)
     options = {
         'optimization': 'fair',
         'O': 'fair',
         'queues': args.queues,
         'concurrency': args.concurrency,
+        'autoscale': autoscale,
         'hostname': args.celery_hostname,
+        'loglevel': conf.get('core', 'LOGGING_LEVEL'),
     }
+
+    if conf.has_option("celery", "pool"):
+        options["pool"] = conf.get("celery", "pool")
 
     if args.daemon:
         pid, stdout, stderr, log_file = setup_locations("worker",
@@ -1160,9 +1136,9 @@ def worker(args):
         sp.kill()
 
 
-def initdb(args):  # noqa
+def initdb(args):
     print("DB: " + repr(settings.engine.url))
-    db_utils.initdb(settings.RBAC)
+    db.initdb()
     print("Done.")
 
 
@@ -1171,31 +1147,19 @@ def resetdb(args):
     if args.yes or input("This will drop existing tables "
                          "if they exist. Proceed? "
                          "(y/n)").upper() == "Y":
-        db_utils.resetdb(settings.RBAC)
+        db.resetdb()
     else:
         print("Bail.")
 
 
 @cli_utils.action_logging
-def upgradedb(args):  # noqa
+def upgradedb(args):
     print("DB: " + repr(settings.engine.url))
-    db_utils.upgradedb()
-
-    # Populate DagStats table
-    session = settings.Session()
-    ds_rows = session.query(DagStat).count()
-    if not ds_rows:
-        qry = (
-            session.query(DagRun.dag_id, DagRun.state, func.count('*'))
-                   .group_by(DagRun.dag_id, DagRun.state)
-        )
-        for dag_id, state, count in qry:
-            session.add(DagStat(dag_id=dag_id, state=state, count=count))
-        session.commit()
+    db.upgradedb()
 
 
 @cli_utils.action_logging
-def version(args):  # noqa
+def version(args):
     print(settings.HEADER + "  v" + airflow.__version__)
 
 
@@ -1221,20 +1185,20 @@ def connections(args):
             log.info(msg)
             return
 
-        session = settings.Session()
-        conns = session.query(Connection.conn_id, Connection.conn_type,
-                              Connection.host, Connection.port,
-                              Connection.is_encrypted,
-                              Connection.is_extra_encrypted,
-                              Connection.extra).all()
-        conns = [map(reprlib.repr, conn) for conn in conns]
-        msg = tabulate(conns, ['Conn Id', 'Conn Type', 'Host', 'Port',
-                               'Is Encrypted', 'Is Extra Encrypted', 'Extra'],
-                       tablefmt="fancy_grid")
-        if sys.version_info[0] < 3:
-            msg = msg.encode('utf-8')
-        log.info(msg)
-        return
+        with db.create_session() as session:
+            conns = session.query(Connection.conn_id, Connection.conn_type,
+                                  Connection.host, Connection.port,
+                                  Connection.is_encrypted,
+                                  Connection.is_extra_encrypted,
+                                  Connection.extra).all()
+            conns = [map(reprlib.repr, conn) for conn in conns]
+            msg = tabulate(conns, ['Conn Id', 'Conn Type', 'Host', 'Port',
+                                   'Is Encrypted', 'Is Extra Encrypted', 'Extra'],
+                           tablefmt="fancy_grid")
+            if sys.version_info[0] < 3:
+                msg = msg.encode('utf-8')
+            print(msg)
+            return
 
     if args.delete:
         # Check that only the `conn_id` arg was passed to the command
@@ -1254,31 +1218,30 @@ def connections(args):
                   'the --conn_id flag.\n')
             return
 
-        session = settings.Session()
-        try:
-            to_delete = (session
-                         .query(Connection)
-                         .filter(Connection.conn_id == args.conn_id)
-                         .one())
-        except exc.NoResultFound:
-            msg = '\n\tDid not find a connection with `conn_id`={conn_id}\n'
-            msg = msg.format(conn_id=args.conn_id)
-            print(msg)
+        with db.create_session() as session:
+            try:
+                to_delete = (session
+                             .query(Connection)
+                             .filter(Connection.conn_id == args.conn_id)
+                             .one())
+            except exc.NoResultFound:
+                msg = '\n\tDid not find a connection with `conn_id`={conn_id}\n'
+                msg = msg.format(conn_id=args.conn_id)
+                print(msg)
+                return
+            except exc.MultipleResultsFound:
+                msg = ('\n\tFound more than one connection with ' +
+                       '`conn_id`={conn_id}\n')
+                msg = msg.format(conn_id=args.conn_id)
+                print(msg)
+                return
+            else:
+                deleted_conn_id = to_delete.conn_id
+                session.delete(to_delete)
+                msg = '\n\tSuccessfully deleted `conn_id`={conn_id}\n'
+                msg = msg.format(conn_id=deleted_conn_id)
+                print(msg)
             return
-        except exc.MultipleResultsFound:
-            msg = ('\n\tFound more than one connection with ' +
-                   '`conn_id`={conn_id}\n')
-            msg = msg.format(conn_id=args.conn_id)
-            print(msg)
-            return
-        else:
-            deleted_conn_id = to_delete.conn_id
-            session.delete(to_delete)
-            session.commit()
-            msg = '\n\tSuccessfully deleted `conn_id`={conn_id}\n'
-            msg = msg.format(conn_id=deleted_conn_id)
-            print(msg)
-        return
 
     if args.add:
         # Check that the conn_id and conn_uri args were passed to the command:
@@ -1317,26 +1280,25 @@ def connections(args):
         if args.conn_extra is not None:
             new_conn.set_extra(args.conn_extra)
 
-        session = settings.Session()
-        if not (session.query(Connection)
-                       .filter(Connection.conn_id == new_conn.conn_id).first()):
-            session.add(new_conn)
-            session.commit()
-            msg = '\n\tSuccessfully added `conn_id`={conn_id} : {uri}\n'
-            msg = msg.format(conn_id=new_conn.conn_id,
-                             uri=args.conn_uri or
-                             urlunparse((args.conn_type,
-                                        '{login}:{password}@{host}:{port}'
-                                         .format(login=args.conn_login or '',
-                                                 password=args.conn_password or '',
-                                                 host=args.conn_host or '',
-                                                 port=args.conn_port or ''),
-                                         args.conn_schema or '', '', '', '')))
-            print(msg)
-        else:
-            msg = '\n\tA connection with `conn_id`={conn_id} already exists\n'
-            msg = msg.format(conn_id=new_conn.conn_id)
-            print(msg)
+        with db.create_session() as session:
+            if not (session.query(Connection)
+                           .filter(Connection.conn_id == new_conn.conn_id).first()):
+                session.add(new_conn)
+                msg = '\n\tSuccessfully added `conn_id`={conn_id} : {uri}\n'
+                msg = msg.format(conn_id=new_conn.conn_id,
+                                 uri=args.conn_uri or
+                                 urlunparse((args.conn_type,
+                                            '{login}:{password}@{host}:{port}'
+                                             .format(login=args.conn_login or '',
+                                                     password=args.conn_password or '',
+                                                     host=args.conn_host or '',
+                                                     port=args.conn_port or ''),
+                                             args.conn_schema or '', '', '', '')))
+                print(msg)
+            else:
+                msg = '\n\tA connection with `conn_id`={conn_id} already exists\n'
+                msg = msg.format(conn_id=new_conn.conn_id)
+                print(msg)
 
         return
 
@@ -1353,6 +1315,10 @@ def flower(args):
     url_prefix = ''
     if args.url_prefix:
         url_prefix = '--url-prefix=' + args.url_prefix
+
+    basic_auth = ''
+    if args.basic_auth:
+        basic_auth = '--basic_auth=' + args.basic_auth
 
     flower_conf = ''
     if args.flower_conf:
@@ -1375,7 +1341,7 @@ def flower(args):
 
         with ctx:
             os.execvp("flower", ['flower', '-b',
-                                 broka, address, port, api, flower_conf, url_prefix])
+                                 broka, address, port, api, flower_conf, url_prefix, basic_auth])
 
         stdout.close()
         stderr.close()
@@ -1384,11 +1350,11 @@ def flower(args):
         signal.signal(signal.SIGTERM, sigint_handler)
 
         os.execvp("flower", ['flower', '-b',
-                             broka, address, port, api, flower_conf, url_prefix])
+                             broka, address, port, api, flower_conf, url_prefix, basic_auth])
 
 
 @cli_utils.action_logging
-def kerberos(args):  # noqa
+def kerberos(args):
     print(settings.HEADER)
     import airflow.security.kerberos
 
@@ -1408,12 +1374,12 @@ def kerberos(args):  # noqa
         )
 
         with ctx:
-            airflow.security.kerberos.run()
+            airflow.security.kerberos.run(principal=args.principal, keytab=args.keytab)
 
         stdout.close()
         stderr.close()
     else:
-        airflow.security.kerberos.run()
+        airflow.security.kerberos.run(principal=args.principal, keytab=args.keytab)
 
 
 @cli_utils.action_logging
@@ -1432,7 +1398,7 @@ def users(args):
 
         return
 
-    if args.create:
+    elif args.create:
         fields = {
             'role': args.role,
             'username': args.username,
@@ -1470,7 +1436,7 @@ def users(args):
         else:
             raise SystemExit('Failed to create user.')
 
-    if args.delete:
+    elif args.delete:
         if not args.username:
             raise SystemExit('Required arguments are missing: username')
 
@@ -1486,6 +1452,54 @@ def users(args):
             print('User {} deleted.'.format(args.username))
         else:
             raise SystemExit('Failed to delete user.')
+
+    elif args.add_role or args.remove_role:
+        if args.add_role and args.remove_role:
+            raise SystemExit('Conflicting args: --add-role and --remove-role'
+                             ' are mutually exclusive')
+
+        if not args.username and not args.email:
+            raise SystemExit('Missing args: must supply one of --username or --email')
+
+        if args.username and args.email:
+            raise SystemExit('Conflicting args: must supply either --username'
+                             ' or --email, but not both')
+        if not args.role:
+            raise SystemExit('Required args are missing: role')
+
+        appbuilder = cached_appbuilder()
+        user = (appbuilder.sm.find_user(username=args.username) or
+                appbuilder.sm.find_user(email=args.email))
+        if not user:
+            raise SystemExit('User "{}" does not exist'.format(
+                args.username or args.email))
+
+        role = appbuilder.sm.find_role(args.role)
+        if not role:
+            raise SystemExit('"{}" is not a valid role.'.format(args.role))
+
+        if args.remove_role:
+            if role in user.roles:
+                user.roles = [r for r in user.roles if r != role]
+                appbuilder.sm.update_user(user)
+                print('User "{}" removed from role "{}".'.format(
+                    user,
+                    args.role))
+            else:
+                raise SystemExit('User "{}" is not a member of role "{}".'.format(
+                    user,
+                    args.role))
+        elif args.add_role:
+            if role in user.roles:
+                raise SystemExit('User "{}" is already a member of role "{}".'.format(
+                    user,
+                    args.role))
+            else:
+                user.roles.append(role)
+                appbuilder.sm.update_user(user)
+                print('User "{}" added to role "{}".'.format(
+                    user,
+                    args.role))
 
 
 @cli_utils.action_logging
@@ -1563,13 +1577,10 @@ def list_dag_runs(args, dag=None):
                                tablefmt="fancy_grid"))
 
 @cli_utils.action_logging
-def sync_perm(args): # noqa
-    if settings.RBAC:
-        appbuilder = cached_appbuilder()
-        print('Update permission, view-menu for all existing roles')
-        appbuilder.sm.sync_roles()
-    else:
-        print('The sync_perm command only works for rbac UI.')
+def sync_perm(args):
+    appbuilder = cached_appbuilder()
+    print('Update permission, view-menu for all existing roles')
+    appbuilder.sm.sync_roles()
 
 
 Arg = namedtuple(
@@ -1782,8 +1793,7 @@ class CLIFactory(object):
             help="Delete a variable"),
         # kerberos
         'principal': Arg(
-            ("principal",), "kerberos principal",
-            nargs='?', default=conf.get('kerberos', 'principal')),
+            ("principal",), "kerberos principal", nargs='?'),
         'keytab': Arg(
             ("-kt", "--keytab"), "keytab",
             nargs='?', default=conf.get('kerberos', 'keytab')),
@@ -1883,10 +1893,6 @@ class CLIFactory(object):
                  "stderr."),
         # scheduler
         'dag_id_opt': Arg(("-d", "--dag_id"), help="The id of the dag to run"),
-        'run_duration': Arg(
-            ("-r", "--run-duration"),
-            default=None, type=int,
-            help="Set number of seconds to execute before exiting"),
         'num_runs': Arg(
             ("-n", "--num_runs"),
             default=-1, type=int,
@@ -1931,6 +1937,12 @@ class CLIFactory(object):
             ("-u", "--url_prefix"),
             default=conf.get('celery', 'FLOWER_URL_PREFIX'),
             help="URL prefix for Flower"),
+        'flower_basic_auth': Arg(
+            ("-ba", "--basic_auth"),
+            default=conf.get('celery', 'FLOWER_BASIC_AUTH'),
+            help=("Securing Flower with Basic Authentication. "
+                  "Accepts user:password pairs separated by a comma. "
+                  "Example: flower_basic_auth = user1:password1,user2:password2")),
         'task_params': Arg(
             ("-tp", "--task_params"),
             help="Sends a JSON params dict to the task"),
@@ -2028,6 +2040,17 @@ class CLIFactory(object):
             ('-d', '--delete'),
             help='Delete a user',
             action='store_true'),
+        'add_role': Arg(
+            ('--add-role',),
+            help='Add user to a role',
+            action='store_true'),
+        'remove_role': Arg(
+            ('--remove-role',),
+            help='Remove user from a role',
+            action='store_true'),
+        'autoscale': Arg(
+            ('-a', '--autoscale'),
+            help="Minimum and Maximum number of worker to autoscale"),
 
     }
     subparsers = (
@@ -2163,19 +2186,19 @@ class CLIFactory(object):
         }, {
             'func': scheduler,
             'help': "Start a scheduler instance",
-            'args': ('dag_id_opt', 'subdir', 'run_duration', 'num_runs',
+            'args': ('dag_id_opt', 'subdir', 'num_runs',
                      'do_pickle', 'pid', 'daemon', 'stdout', 'stderr',
                      'log_file'),
         }, {
             'func': worker,
             'help': "Start a Celery worker node",
             'args': ('do_pickle', 'queues', 'concurrency', 'celery_hostname',
-                     'pid', 'daemon', 'stdout', 'stderr', 'log_file'),
+                     'pid', 'daemon', 'stdout', 'stderr', 'log_file', 'autoscale'),
         }, {
             'func': flower,
             'help': "Start a Celery Flower",
             'args': ('flower_hostname', 'flower_port', 'flower_conf', 'flower_url_prefix',
-                     'broker_api', 'pid', 'daemon', 'stdout', 'stderr', 'log_file'),
+                     'flower_basic_auth', 'broker_api', 'pid', 'daemon', 'stdout', 'stderr', 'log_file'),
         }, {
             'func': version,
             'help': "Show the version",
@@ -2187,8 +2210,9 @@ class CLIFactory(object):
                      'conn_id', 'conn_uri', 'conn_extra') + tuple(alternative_conn_specs),
         }, {
             'func': users,
-            'help': "List/Create/Delete users",
+            'help': "List/Create/Delete/Update users",
             'args': ('list_users', 'create_user', 'delete_user',
+                     'add_role', 'remove_role',
                      'username', 'email', 'firstname', 'lastname', 'role',
                      'password', 'use_random_password'),
         },
@@ -2201,7 +2225,14 @@ class CLIFactory(object):
             'func': next_execution,
             'help': "Get the next execution datetime of a DAG.",
             'args': ('dag_id', 'subdir')
-        }
+        },
+        {
+            'func': rotate_fernet_key,
+            'help': 'Rotate all encrypted connection credentials and variables; see '
+                    'https://airflow.readthedocs.io/en/stable/howto/secure-connections.html'
+                    '#rotating-encryption-keys.',
+            'args': (),
+        },
     )
     subparsers_dict = {sp['func'].__name__: sp for sp in subparsers}
     dag_subparsers = (
