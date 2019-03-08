@@ -53,7 +53,7 @@ from airflow import models, jobs
 from airflow import settings
 from airflow.api.common.experimental.mark_tasks import (set_dag_run_state_to_success,
                                                         set_dag_run_state_to_failed)
-from airflow.models import DagRun, errors
+from airflow.models import DagRun, errors, DagModel
 from airflow.models.connection import Connection
 from airflow.models.log import Log
 from airflow.models.slamiss import SlaMiss
@@ -62,7 +62,7 @@ from airflow.models.xcom import XCom
 from airflow.ti_deps.dep_context import DepContext, QUEUE_DEPS, SCHEDULER_DEPS
 from airflow.utils import timezone
 from airflow.utils.dates import infer_time_unit, scale_time_units
-from airflow.utils.db import provide_session
+from airflow.utils.db import provide_session, create_session
 from airflow.utils.helpers import alchemy_to_dict, render_log_filename
 from airflow.utils.json import json_ser
 from airflow.utils.state import State
@@ -425,7 +425,9 @@ class Airflow(AirflowBaseView):
     @provide_session
     def dag_details(self, session=None):
         dag_id = request.args.get('dag_id')
-        dag = dagbag.get_dag(dag_id)
+        dag_orm = DagModel.get_dagmodel(dag_id)
+        # FIXME: items needed for this view should move to the database
+        dag = dag_orm.get_dag()
         title = "DAG details"
         root = request.args.get('root', '')
 
@@ -438,10 +440,9 @@ class Airflow(AirflowBaseView):
         )
 
         active_runs = models.DagRun.find(
-            dag_id=dag.dag_id,
+            dag_id=dag_id,
             state=State.RUNNING,
-            external_trigger=False,
-            session=session
+            external_trigger=False
         )
 
         return self.render(
@@ -599,7 +600,7 @@ class Airflow(AirflowBaseView):
         execution_date = request.args.get('execution_date')
         dttm = pendulum.parse(execution_date)
         form = DateTimeForm(data={'execution_date': dttm})
-        dag = dagbag.get_dag(dag_id)
+        dag_model = DagModel.get_dagmodel(dag_id)
 
         ti = session.query(models.TaskInstance).filter(
             models.TaskInstance.dag_id == dag_id,
@@ -616,8 +617,8 @@ class Airflow(AirflowBaseView):
         root = request.args.get('root', '')
         return self.render(
             'airflow/ti_log.html',
-            logs=logs, dag=dag, title="Log by attempts",
-            dag_id=dag.dag_id, task_id=task_id,
+            logs=logs, dag=dag_model, title="Log by attempts",
+            dag_id=dag_id, task_id=task_id,
             execution_date=execution_date, form=form,
             root=root)
 
@@ -1158,15 +1159,15 @@ class Airflow(AirflowBaseView):
     @has_access
     @gzipped
     @action_logging
-    @provide_session
-    def tree(self, session=None):
+    def tree(self):
         default_dag_run = conf.getint('webserver', 'default_dag_run_display_number')
         dag_id = request.args.get('dag_id')
         blur = conf.getboolean('webserver', 'demo_mode')
-        dag = dagbag.get_dag(dag_id)
-        if dag_id not in dagbag.dags:
-            flash('DAG "{0}" seems to be missing.'.format(dag_id), "error")
+        dag_model = DagModel.get_dagmodel(dag_id)
+        if not dag_model:
+            flash('DAG "{0}" seems to be missing in database.'.format(dag_id), "error")
             return redirect('/')
+        dag = dag_model.get_dag()
 
         root = request.args.get('root')
         if root:
@@ -1184,16 +1185,16 @@ class Airflow(AirflowBaseView):
         else:
             base_date = dag.latest_execution_date or timezone.utcnow()
 
-        DR = models.DagRun
-        dag_runs = (
-            session.query(DR)
-            .filter(
-                DR.dag_id == dag.dag_id,
-                DR.execution_date <= base_date)
-            .order_by(DR.execution_date.desc())
-            .limit(num_runs)
-            .all()
-        )
+        with create_session() as session:
+            dag_runs = (
+                session.query(DagRun)
+                .filter(
+                    DagRun.dag_id == dag.dag_id,
+                    DagRun.execution_date <= base_date)
+                .order_by(DagRun.execution_date.desc())
+                .limit(num_runs)
+                .all()
+            )
         dag_runs = {
             dr.execution_date: alchemy_to_dict(dr) for dr in dag_runs}
 
@@ -1201,8 +1202,7 @@ class Airflow(AirflowBaseView):
         max_date = max(dates) if dates else None
         min_date = min(dates) if dates else None
 
-        tis = dag.get_task_instances(
-            session, start_date=min_date, end_date=base_date)
+        tis = dag.get_task_instances(start_date=min_date, end_date=base_date)
         task_instances = {}
         for ti in tis:
             tid = alchemy_to_dict(ti)
@@ -1351,7 +1351,7 @@ class Airflow(AirflowBaseView):
 
         task_instances = {
             ti.task_id: alchemy_to_dict(ti)
-            for ti in dag.get_task_instances(session, dttm, dttm)}
+            for ti in dag.get_task_instances(dttm, dttm)}
         tasks = {
             t.task_id: {
                 'dag_id': t.dag_id,
@@ -1427,8 +1427,7 @@ class Airflow(AirflowBaseView):
         x = defaultdict(list)
         cum_y = defaultdict(list)
 
-        tis = dag.get_task_instances(
-            session, start_date=min_date, end_date=base_date)
+        tis = dag.get_task_instances(start_date=min_date, end_date=base_date)
         TF = TaskFail
         ti_fails = (
             session.query(TF)
@@ -1533,16 +1532,14 @@ class Airflow(AirflowBaseView):
         for task in dag.tasks:
             y = []
             x = []
-            for ti in task.get_task_instances(session, start_date=min_date,
-                                              end_date=base_date):
+            for ti in task.get_task_instances(start_date=min_date, end_date=base_date):
                 dttm = wwwutils.epoch(ti.execution_date)
                 x.append(dttm)
                 y.append(ti.try_number)
             if x:
                 chart.add_serie(name=task.task_id, x=x, y=y)
 
-        tis = dag.get_task_instances(
-            session, start_date=min_date, end_date=base_date)
+        tis = dag.get_task_instances(start_date=min_date, end_date=base_date)
         tries = sorted(list({ti.try_number for ti in tis}))
         max_date = max([ti.execution_date for ti in tis]) if tries else None
 
@@ -1598,8 +1595,7 @@ class Airflow(AirflowBaseView):
         for task in dag.tasks:
             y[task.task_id] = []
             x[task.task_id] = []
-            for ti in task.get_task_instances(session, start_date=min_date,
-                                              end_date=base_date):
+            for ti in task.get_task_instances(start_date=min_date, end_date=base_date):
                 ts = ti.execution_date
                 if dag.schedule_interval and dag.following_schedule(ts):
                     ts = dag.following_schedule(ts)
@@ -1621,8 +1617,7 @@ class Airflow(AirflowBaseView):
                 chart.add_serie(name=task.task_id, x=x[task.task_id],
                                 y=scale_time_units(y[task.task_id], y_unit))
 
-        tis = dag.get_task_instances(
-            session, start_date=min_date, end_date=base_date)
+        tis = dag.get_task_instances(start_date=min_date, end_date=base_date)
         dates = sorted(list({ti.execution_date for ti in tis}))
         max_date = max([ti.execution_date for ti in tis]) if dates else None
 
@@ -1645,22 +1640,16 @@ class Airflow(AirflowBaseView):
     @has_dag_access(can_dag_edit=True)
     @has_access
     @action_logging
-    @provide_session
-    def paused(self, session=None):
+    def paused(self):
         DagModel = models.DagModel
         dag_id = request.args.get('dag_id')
-        orm_dag = (
-            session.query(DagModel)
-                   .filter(DagModel.dag_id == dag_id).first()
-        )
+        orm_dag = DagModel.get_dagmodel(dag_id)
         if request.args.get('is_paused') == 'false':
             orm_dag.is_paused = True
         else:
             orm_dag.is_paused = False
-        session.merge(orm_dag)
-        session.commit()
-
-        dagbag.get_dag(dag_id)
+        with create_session() as session:
+            session.merge(orm_dag)
         return "OK"
 
     @expose('/refresh')
@@ -1721,7 +1710,7 @@ class Airflow(AirflowBaseView):
         form.execution_date.choices = dt_nr_dr_data['dr_choices']
 
         tis = [
-            ti for ti in dag.get_task_instances(session, dttm, dttm)
+            ti for ti in dag.get_task_instances(dttm, dttm)
             if ti.start_date]
         tis = sorted(tis, key=lambda ti: ti.start_date)
         TF = TaskFail
@@ -1797,7 +1786,7 @@ class Airflow(AirflowBaseView):
 
         task_instances = {
             ti.task_id: alchemy_to_dict(ti)
-            for ti in dag.get_task_instances(session, dttm, dttm)}
+            for ti in dag.get_task_instances(dttm, dttm)}
 
         return json.dumps(task_instances)
 
